@@ -1,3 +1,8 @@
+Please note the Readme is not yet updated for this version of the fork.
+If you want to try the mod download the latest version in Releases and launch the EXE loader.
+
+
+
 # mgmp — co-op multiplayer for Mewgenics
 
 An unofficial mod that lets two people play one Mewgenics adventure together.
