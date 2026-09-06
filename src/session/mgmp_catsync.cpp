@@ -10,6 +10,8 @@
 #include "mgmp_net.h"
 #include "mgmp_proto.h"
 #include "mgmp_lockstep.h"   // lockstep_in_battle
+#include "mgmp_follow.h"     // follow_on_map -- see the new hold branch below
+#include "mgmp_invlock.h"    // invlock_note_authoritative_catdata -- F6 redesign
 
 #include <windows.h>
 #include <cstdio>
@@ -18,6 +20,105 @@
 
 namespace mgmp {
 namespace {
+
+// THE EQUIP-SLOT CLEAR-BEFORE-READ FIX, 2026-09-05.
+//
+// Found live: applying a SMALLER (unequipped) cat blob onto an already-larger
+// (equipped) live CatData round-trips back out byte-for-byte UNCHANGED --
+// confirmed with a diagnostic that re-serializes the same object immediately
+// after applying and compares hashes. Applying a LARGER (freshly-equipped)
+// blob onto an empty object works perfectly. So SerializeCatData's read mode
+// appears to WRITE an equip slot when the stream describes one, but never
+// clears a slot the stream does NOT describe -- exactly the shape of a
+// deserializer that was only ever exercised via ContinueAdventure, onto a
+// freshly-constructed (already-empty) object, and never onto an
+// already-populated live one.
+//
+// CONFIRMED BY LIVE MEMORY DIFF, not guessed: dumping the raw CatData object
+// (not the serialized stream) in six different equip states and cross-diffing
+// all pairs isolates exactly four self-contained, identically-shaped 0x60-byte
+// regions at CatData+0xA10, +0xA70, +0xAD0, +0xB30 -- verified byte-identical
+// across all four when empty, in more than one independent capture. Each
+// holds an 8-byte id (0xFFFFFFFFFFFFFFFF when nothing is equipped) followed by
+// the item's GON name inline and some reserved bytes; a real item's name
+// ("Debris", "CardboardArmor", "CatnipBig") appeared readably at the expected
+// slot the moment that item was equipped, and only that slot changed --
+// no cross-slot interference was ever observed.
+//
+// THE FIX: reset all four slots to the exact empty pattern (copied byte for
+// byte from a live, verified-empty object -- not reconstructed field by
+// field) immediately before every read, on every apply. This is the same
+// discipline the game's OWN inventory bucket reader already applies to the
+// run's shared buckets ("the reader clears before it repopulates" --
+// mgmp_invsync.cpp) -- CatData's own deserializer just never does it for
+// itself. Safe to do unconditionally: a slot the incoming stream DOES
+// describe gets overwritten by the real read moments later (the grow
+// direction already proves the writer does not need a slot pre-cleared to
+// populate it); a slot the stream does not mention is left in the one state
+// that is unambiguously correct for "nothing here" instead of whatever a
+// PRIOR apply happened to leave behind.
+constexpr uintptr_t kCatEquipSlotBase   = 0xA10;
+constexpr uintptr_t kCatEquipSlotStride = 0x60;
+constexpr uint32_t  kCatEquipSlotCount  = 4;
+const uint8_t kEmptyEquipSlot[kCatEquipSlotStride] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+    0x7F, 0x96, 0x98, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+bool reset_equip_slots(void* cat) {
+    uint8_t* base = (uint8_t*)cat + kCatEquipSlotBase;
+    for (uint32_t i = 0; i < kCatEquipSlotCount; ++i) {
+        if (!mem_write(base + i * kCatEquipSlotStride, kEmptyEquipSlot,
+                       sizeof(kEmptyEquipSlot)))
+            return false;
+    }
+    return true;
+}
+
+// THE SAME BUG, A SECOND FIELD -- CatData+1976, 2026-09-06.
+//
+// CatData+1976 (0x7b8) is the "pending next-fight status" list
+// (self_status_next_fight's handler push_back's onto it, per
+// CLAUDE.md/Battle architecture). Confirmed live by memory diff across a real
+// apply_now call: BEFORE, a standard MSVC std::vector<T> {begin,end,cap_end}
+// at +1976/+1984/+1992 held 1 entry (begin+0xB8==end==cap_end, i.e. full,
+// zero spare capacity -- one 0xB8-byte record); immediately AFTER the SAME
+// apply_now call (no other code ran in between), the vector had reallocated
+// to a NEW buffer holding 2 entries (size 0x170 = 2*0xB8). The stream being
+// applied only ever describes what changed since the LAST sync, never a
+// full snapshot the receiver could safely overwrite onto -- so, exactly like
+// the equip slots, SerializeCatData's read mode APPENDS a status entry the
+// stream carries but never clears the list first. Symptom: an event that
+// applies e.g. Poison 2 while both peers are on the map (correct, 1 entry
+// everywhere) desyncs the instant the affected cat's CatData is resynced
+// again before battle entry -- the client's own game-native load already
+// populated the list once, then this mod's OWN publish/apply round trip
+// appends a second copy on top, so the client's cat enters battle with 2
+// pending status entries where the host has 1: Poison 2 becomes Poison 4,
+// state_hash disagrees on turn 1, HALT.
+//
+// THE FIX, same discipline as the equip slots: reset the vector to genuinely
+// empty (begin=end=cap_end=nullptr) immediately before every read, on every
+// apply. The old buffer is deliberately leaked rather than freed -- entries
+// may embed std::strings with their own separate heap allocations, and we do
+// not have (nor want to guess) the game's real destructor/allocator for this
+// type. A few hundred bytes leaked per resync of an already-poisoned cat is
+// the correct trade against a full-session softlock. The incoming stream's
+// own count-then-push_back loop repopulates the list from empty exactly like
+// a freshly-constructed CatData would, which is the one state this
+// deserializer has ever been proven to handle correctly.
+constexpr uintptr_t kCatStatusListBase = 1976;
+
+bool reset_status_list(void* cat) {
+    const uint8_t zero[24] = {};
+    return mem_write((uint8_t*)cat + kCatStatusListBase, zero, sizeof(zero));
+}
 
 // The ByteStream's layout now lives in mgmp_bytestream.h -- mgmp_runhist drives
 // the same struct through a different serializer, and one copy of an offset
@@ -270,15 +371,58 @@ void catsync_shutdown() {
 // node -- and it has none of the others.
 void catsync_forget() {
     ensure_state();
-    if (!g.on || g.is_client) return;
+    if (!g.on) return;
     g.sent_count = 0;
     memset(g.sent_id,   0, sizeof(g.sent_id));
     memset(g.sent_hash, 0, sizeof(g.sent_hash));
 }
 
+void* catsync_resolve_by_id(uint64_t id) {
+    ensure_state();
+    if (!g.on) return nullptr;
+    RunCats rc{};
+    if (!run_cats(rc)) return nullptr;
+    void* cat = nullptr;
+    if (!safe_by_id((void*)rc.registry, id, &cat)) return nullptr;
+    return cat;
+}
+
+bool catsync_id_for(const void* cat_data, uint64_t& out_id) {
+    out_id = 0;
+    ensure_state();
+    if (!g.on || !cat_data) return false;
+    RunCats rc{};
+    if (!run_cats(rc)) return false;
+    for (uint32_t i = 0; i < rc.count; ++i) {
+        uint64_t id = 0;
+        if (!mem_read(&rc.ids[i], &id, sizeof(id)) || !id) continue;
+        void* cat = nullptr;
+        if (!safe_by_id((void*)rc.registry, id, &cat) || !cat) continue;
+        if (cat == cat_data) { out_id = id; return true; }
+    }
+    return false;
+}
+
+bool catsync_run_cat_ids(uint64_t* out_ids, uint32_t max, uint32_t* out_count) {
+    if (out_count) *out_count = 0;
+    if (!out_ids || !max || !out_count) return false;
+    ensure_state();
+    if (!g.on) return false;
+    RunCats rc{};
+    if (!run_cats(rc)) return false;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < rc.count && n < max; ++i) {
+        uint64_t id = 0;
+        if (!mem_read(&rc.ids[i], &id, sizeof(id)) || !id) continue;
+        out_ids[n++] = id;
+    }
+    *out_count = n;
+    return true;
+}
+
 void catsync_publish(const char* why) {
     ensure_state();
-    if (!g.on || g.is_client || !net_active()) return;
+    if (!g.on || !net_active()) return;
 
     RunCats rc{};
     if (!run_cats(rc)) {
@@ -349,6 +493,20 @@ static void apply_now(const CatDataMsg& m, const char* when) {
         return;
     }
 
+    if (!reset_equip_slots(cat)) {
+        log_line("CATSYNC", "!! could not reset cat %016llx's equip slots -- "
+                            "not applied, to avoid a stale item surviving "
+                            "under a partial write", (unsigned long long)m.id);
+        return;
+    }
+
+    if (!reset_status_list(cat)) {
+        log_line("CATSYNC", "!! could not reset cat %016llx's pending-status "
+                            "list -- not applied, to avoid doubling a "
+                            "next-fight status effect", (unsigned long long)m.id);
+        return;
+    }
+
     uint8_t bs[kByteStreamSize];
     if (!bs_construct(bs)) return;
 
@@ -362,6 +520,25 @@ static void apply_now(const CatDataMsg& m, const char* when) {
     safe_bs_dtor(bs);
 
     if (ok) {
+        // F5 ECHO-LOOP FIX (same root cause as mgmp_invsync's, found live
+        // 2026-09-05): `remembered()` is this peer's own "what have I already
+        // told the other side" cache, and it used to update ONLY on the send
+        // side. The instant this peer applied an incoming cat, its OWN bytes
+        // changed under it without that cache changing to match -- the very
+        // next poll saw a hash that differed from a STALE remembered value
+        // and re-sent the cat it had just received, with the other side then
+        // re-applying it and repeating the cycle. Setting it here, to the
+        // hash that was just verified and applied, is what makes "nothing
+        // has changed since the other side's last word" true again
+        // immediately.
+        if (uint64_t* prev = remembered(m.id)) *prev = m.hash;
+
+        // F6, 2026-09-06 redesign: tell mgmp_invlock's per-frame equip-slot
+        // poll that these bytes were JUST written legitimately, so its very
+        // next check does not mistake this apply for a local click and
+        // revert it right back out. See mgmp_invlock.h.
+        invlock_note_authoritative_catdata(m.id, cat);
+
         ++g.applied;
         log_line("CATSYNC", "<- applied cat %016llx (%u bytes, %s)",
                  (unsigned long long)m.id, m.size, when);
@@ -405,10 +582,13 @@ static bool stash_pending(const CatDataMsg& m) {
     return true;
 }
 
-// Deferral is only correct while something is guaranteed to drain the queue,
-// and that something is the client's map-follow tick -- the same rule and the
-// same helper shape as mgmp_invsync.
-static bool defer_applies() { return g.is_client && config().net_follow; }
+// Deferral is only correct while something is guaranteed to drain the queue.
+// For the client that is the map-follow tick, gated on net_follow -- with it
+// off nothing would ever drain the queue, so applying immediately is the only
+// option left. For the HOST that guarantee is now its own EnterNode hook
+// (mgmp_follow.cpp's host branch calls catsync_apply_pending too) --
+// unconditional, because the host always drives its own node entries.
+static bool defer_applies() { return g.is_client ? config().net_follow : true; }
 
 void catsync_apply_pending(const char* why) {
     ensure_state();
@@ -430,14 +610,6 @@ void catsync_apply_pending(const char* why) {
 void catsync_on_message(const CatDataMsg& m) {
     ensure_state();
     if (!g.on) return;
-    if (!g.is_client) {
-        // The host is authoritative; a cat arriving here means both peers think
-        // they own the run, which is a configuration error worth naming rather
-        // than a state to merge.
-        log_line("CATSYNC", "!! received a cat from the peer while hosting -- "
-                            "ignored (both peers configured as host?)");
-        return;
-    }
     if (!m.data || !m.size) return;
 
     // NOT WHILE A BATTLE THIS PEER IS ALREADY IN IS RUNNING -- but HELD, never
@@ -470,6 +642,29 @@ void catsync_on_message(const CatDataMsg& m) {
     // applied over 22 turns and three map nodes, the two runs forked, and the
     // next battle opened with a turn-0 state-only mismatch.
     //
+    // NOT WHILE THE MAP ISN'T TICKING, either -- found live 2026-09-05.
+    // MapScreen::update simply does not run while a modal screen like the
+    // inventory is open (confirmed: a debug scan hooked to it produced zero
+    // output the whole time the screen was up, every time, and fired
+    // normally the instant it closed). Applying straight into a cat's equip
+    // slots while that exact screen is actively showing them is not a
+    // desync -- the object is correct moments later -- but it is a person
+    // watching their own inventory appear to empty out and repopulate.
+    // follow_on_map() is the same 250ms staleness window mgmp_savefile
+    // already trusts for "is the run between nodes", reused rather than
+    // reinvented. Gated on net_follow for the same reason the battle branch
+    // is: without it nothing drains the hold, and applying immediately is
+    // strictly better than applying never. Drained by follow_map_update on
+    // EVERY tick now (not only at node entry), so this lands the instant the
+    // screen closes rather than waiting for the next node.
+    if (g.is_client && config().net_follow && !follow_on_map()) {
+        if (stash_pending(m)) {
+            ++g.deferred;
+            return;
+        }
+        // Could not hold -- fall through and apply now rather than drop it.
+    }
+
     // So: hold, and apply at the map-follow tick, exactly where the inventory
     // already lands. That is still before EnterNode, so it is in time for the
     // battle or shop the node opens, and it is off the battle screen, so it

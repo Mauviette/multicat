@@ -1,6 +1,35 @@
 #pragma once
-// mgmp_invsync -- the run inventory is pushed from the host to the client,
-// whole, as bytes the GAME produced through the game's own bucket serializer.
+// mgmp_invsync -- the run inventory is pushed between peers, whole, as bytes
+// the GAME produced through the game's own bucket serializer.
+//
+// SYMMETRIC SINCE 2026-09-05 (F5 -- cahier-des-charges-mgmp-fork.md), TRIGGER
+// STILL PER-NODE-OR-PEER-JOINED ONLY. Used to be host-only: a real gap once
+// F6 let a peer equip their own cats, since the run inventory is a SINGLE
+// shared resource and a client's local equip was invisible to the host until
+// forever. Fixed by letting either peer call invsync_publish/on_message
+// (matching CLAUDE.md's own CONTROL/NODEHASH precedent for state either side
+// can locally change) and adding a Lamport `seq` to InventoryMsg so a stale
+// publish cannot clobber a fresher one (ties go to the host) -- see
+// invsync_on_message.
+//
+// WHAT WAS TRIED AND REVERTED, TWICE, THE SAME NIGHT -- read before adding a
+// tighter trigger than "entering a node": the natural next step, publishing
+// on a timer while mgmp_invlock sees the inventory screen open (so a change
+// reaches the other peer in a fraction of a second instead of waiting for the
+// next node), broke twice. First it broke THIS module's OWN click guard by
+// calling into the heavy game-serialization functions below from inside
+// T_ButtonUpdate, a hook that fires for every button every frame -- moving
+// the call to FrameBegin fixed that specific breakage. Then, even from
+// FrameBegin, calling the game's bucket write/serialize path at ~3 Hz
+// produced ITEM DUPLICATION IN THE GAME'S OWN LOCAL STATE, observed on the
+// SENDING peer with no network involved at all -- that function almost
+// certainly exists to run once per real save, not dozens of times a second.
+// Both attempts were fully reverted; only the symmetric direction and the
+// seq field survive. F5's "immediate" goal is open again. Whatever replaces
+// a timer needs to call the game's serializer AT MOST once per REAL change --
+// e.g. determining Inventory::insert_item's actual ABI (still unknown, no
+// signature generated -- would need IDA) and hooking the true mutation point,
+// not polling for one.
 //
 // THE BUG THIS CLOSES. Equipping an item MOVES it: out of the run inventory and
 // onto the cat. mgmp_catsync ships the cat half, and until now nothing shipped
@@ -72,11 +101,12 @@
 //
 //   - The FOURTH bucket, Inventory+248. Inventory::init builds it identically
 //     to the other three and the game's own save driver does not write it, so
-//     we do not either -- it is almost certainly "currently equipped", which is
-//     redundant with what SerializeCatData already puts on the cat. That is a
-//     reading of the code, not a measurement. If a desync ever appears whose
-//     first sign is an item that exists on both peers but is equipped on only
-//     one, this is the first place to look.
+//     we do not either. RULED OUT as the "currently equipped" tracker,
+//     2026-09-05: measured live (a read-only serialize_bucket() dump on the
+//     HOST across real equip/unequip cycles) that it stays at its empty size
+//     the whole time, even on the host's own normal equip flow. Whatever
+//     tracks equipped items lives entirely in CatData -- see the equip-slot
+//     fix in mgmp_catsync.cpp for where.
 //   - (ADDRESSED, but never observed either way -- see invsync_apply_pending.)
 //     A CLIENT THAT HAS ITS INVENTORY SCREEN OPEN WHEN A PUSH ARRIVES was the
 //     one hazard in this module that is a crash rather than a divergence:
@@ -143,6 +173,19 @@ void invsync_on_message(const InventoryMsg& m);
 // nothing that consumes the inventory -- a battle, a shop -- can have run
 // between the host's push and this peer applying it.
 void invsync_apply_pending(const char* why);
+
+// F6, 2026-09-06: re-apply the last inventory this peer successfully applied,
+// right now. For mgmp_invlock's per-frame equip-slot poll: a raw byte revert
+// of a CLIENT's blocked equip/unequip attempt can put the cat's own equip
+// slot back, but the game's click handler also inserts/removes a node in the
+// shared bag's intrusive list as the OTHER half of the same action, which a
+// plain memory revert cannot undo. Re-running the exact apply this module
+// already trusts for a real network push clears and rebuilds every bucket
+// from scratch via the game's own reader, which correctly discards whatever
+// the local click did to the bag too. A no-op if nothing has ever been
+// successfully applied yet (no run loaded, or no push received this
+// session).
+void invsync_reapply_last_good(const char* why);
 
 // --- the two hook bodies ----------------------------------------------------
 //

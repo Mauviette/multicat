@@ -9,6 +9,7 @@
 #include "mgmp_aim.h"
 #include "mgmp_nodehash.h"
 #include "mgmp_runhist.h"
+#include "mgmp_ownership.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_follow.h"
 #include "mgmp_choice.h"
@@ -175,6 +176,7 @@ void go_ready(const char* how) {
     catsync_init();
     invsync_init();
     runhist_init();
+    ownership_init();
     nodehash_init();
     aim_init();
     choice_init();
@@ -289,12 +291,17 @@ void handle_hello(uint8_t from, const Hello& h) {
     catsync_forget();
     invsync_forget();
     runhist_forget();
+    ownership_forget();
     catsync_publish("a peer joined or reconnected");
     invsync_publish("a peer joined or reconnected");
     // The used-event list belongs in the same burst and for the same reason: a
     // peer whose process restarted has the history that was in the save, which
     // is the run's state at the last checkpoint rather than now.
     runhist_publish("a peer joined or reconnected");
+    // And F2's ownership table -- a joiner has no local copy at all, and this
+    // is also the moment net_peer_count() first reaches 2 for a host who was
+    // playing solo, which is what the initial split itself is gated on.
+    ownership_publish("a peer joined or reconnected");
 
     // ...and finally WHERE the run is. Order is load-bearing and it is the
     // same order follow_on_enter_node uses for the live path: save, then cats
@@ -461,6 +468,7 @@ void session_shutdown() {
     catsync_shutdown();
     invsync_shutdown();
     runhist_shutdown();
+    ownership_shutdown();
     nodehash_shutdown();
     aim_shutdown();
     follow_shutdown();

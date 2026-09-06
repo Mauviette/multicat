@@ -51,7 +51,63 @@ namespace mgmp {
 // So: if the value a peer puts in a message changes meaning, that is a protocol
 // change even when every byte stays where it was. Refusing at connect is free;
 // diagnosing it from a turn-0 halt is not.
-constexpr uint32_t kProtoVersion = 27;  // 2 CONTROL, 3 ENTERNODE, 4 SAVEFILE, 5 epoch, 6 CATDATA, 7 INVENTORY, 8 state hash drops facing + roster cap 254, 9 peer envelope + PEERS (up to 4 players), 10 state hash gains ElementList (tiles + equipment), 11 CURSOR, 12 state hash gains live-list membership and stops hashing departed cats, 13/14/15 CURSOR churn while the pointer moved from the board to the screen, 16 CURSOR carries the cursor-art index -- the peer's pointer is now the game's own texture for the state their game is in, 17 CHOICE -- event and level-up option choices, which is what replaces RUNSTATE, 18 the per-battle epoch COUNTER becomes a u64 battle_id -- the node seed both peers already share -- so battle identity survives a peer restarting, 19 CHOICE carries the node seed it was made on -- a held choice used to have no idea which node it belonged to and could surface on a later one, 20 RUNHIST (the run-history object the event roller reads) + NODEHASH (the meta layer finally gets the per-node check the battle layer has had per turn since version 5), 21 AIM -- the range/AOE tiles the other player is aiming at, drawn on this peer by the game's own Brain::DrawAbilityAOE; cosmetic like CURSOR and hashed by nothing, 22 AIM is read from the PLAYERBRAIN'S SELECTION (PlayerBrain+0x3D8/+0x358/+0x360) instead of the cached decision, and the receiver draws the RANGE tiles as well as the AOE -- not one byte of AimMsg moved, which is exactly the kind of change version 12 established has to bump anyway, 23 the range-tile call that came with 22 is REMOVED -- sub_140138A10 applies statuses rather than drawing, so mirroring it mutated the non-owning peer's simulation and cost a run; the bump exists so a peer still running 22 cannot join and do it, 24 the highlight is back and the tiles with it, but only ever called with sub_140151CE0 -- its apply_status half -- swallowed by T_HighlightRefresh and with the whole roster's cat state fenced across the call, 25 a Move aim also shows the ATTACK RANGE from the hovered square -- the game gets those tiles by displacing the cat and moving it back, so the receiver now makes two TacticsObject::Move calls per frame inside the same state fence; not one byte of AimMsg moved, version 12's rule again, 26 STATEDUMP -- on a hash mismatch each peer sends the per-cat table its own hash was taken over, so the log that halts also names the cat and the field instead of requiring two log files side by side, 27 SAVEFILE carries `fresh` -- whether the host is (re)starting a run from the save screen or catching a peer up. A host that goes back to the menu and picks a slot again starts a NEW run, and the client used to decline that save with "already in the run": the g.applied latch is per-PROCESS and the two sends were byte-identical, so nothing on the receiving side could tell them apart, and HOSTLEFT -- the other half of that story: `fresh` handles the host STARTING a run, HOSTLEFT handles it ENDING one. Both shipped in the same unreleased version, which is the only reason they share a number
+constexpr uint32_t kProtoVersion = 38;  // 38 SaveFileMsg gains `ready`: a save
+// can be published while the host is sitting in the house rather than on the
+// map, and a freshly-connecting client used to follow it straight into that
+// house (breeding/furniture that will never sync -- CLAUDE.md's "the house
+// is out"). ready=0 tells the client to hold the file, unapplied, until a
+// later republish (with ready=1) says the host is genuinely on the map. A
+// peer still on 37 has no field to read past `fresh` and would misread
+// `ready`'s byte as the start of the save's own data.
+// 37 CursorPingMsg gains `active`,
+// changing it from a one-shot fire-and-forget event into a held state: sent
+// on BOTH the down-edge (active=true) and the up-edge (active=false) of
+// cursor.ping_key, so the highlight lasts exactly as long as the key is
+// physically held rather than a fixed timeout. A peer still on 36 expects
+// no payload after the type byte and would misread the new `active` byte as
+// the start of the NEXT frame's length prefix.
+// 36 CURSORPING (F4.2) -- a "look here" hotkey briefly enlarges the sender's
+// cursor on every other peer's screen. A peer still on 35 would decode an
+// unknown type and drop the connection the same way any other unrecognised
+// MsgType does.
+// 35 ScreenVoteMsg gains kVoteChestOpen
+// and a per-node-type threshold: a treasure chest's open AND its shared
+// exit button now fire on the FIRST vote (the clicking peer fires locally,
+// immediately; the other peer follows off the wire), matching a shop
+// purchase's "one click, everyone follows" shape, instead of waiting for
+// every peer to vote the way a real shop/event screen still does. Chosen by
+// reading the CURRENT map node's type (mgmp_follow's own
+// follow_current_node/follow_node_info), because Shop_ExitButton cannot be
+// told apart from a real shop's exit button any other way (same name, same
+// class). ChestButton_alley itself moves from mgmp_shopmirror's per-slot
+// purchase mirror (which never worked for it -- a chest has no "iN" slot
+// key, so the mirror silently never fired) to this same vote/threshold
+// mechanism, needing no item identity at all. A peer still on 34 would
+// treat a kind=2 ScreenVoteMsg as malformed and drop it, and would still
+// wait for a full vote on a chest that this peer's build already resolved
+// with just its own click.
+// ... 30 FACE, 31 SCREENVOTE -- F3.1's
+// screen-exit vote barrier (see ScreenVoteMsg below): either peer's real click
+// on a vote-gated screen-exit button now increments a shared counter instead
+// of firing immediately, and the real exit fires (on BOTH peers, each via its
+// own simulated click) only once the counter reaches the session's peer
+// count. 32 SHOPBUY -- F3.1's purchase mirror (see ShopBuyMsg below): the
+// buyer's real click is let through locally AND published, and the other
+// peer(s) each fire a real click on THEIR OWN matching button, resolved by
+// the shop's own stable per-slot key -- otherwise a purchase that opens a
+// LevelUpScreen (measured live, 2026-09-06: a rare-candy purchase leveled up
+// a cat) only ever opened that screen for the buyer, and the other peer had
+// no screen for mgmp_choice's own LevelUpScreen sync to act on -- softlock.
+// 33 was a same-day, same-session revision that added `levelup_cat_id`
+// straight onto ShopBuyMsg and delayed sending it until a resulting
+// level-up screen was seen or timed out -- superseded by 34 before ever
+// being kept, once that delay turned out to stall EVERY ordinary purchase
+// (no level-up at all, the common case) for the length of the whole watch
+// window. 34 LEVELUPTARGET -- the fix moved to its own independent message
+// (see LevelUpTargetMsg's header note), sent only if/when a level-up screen
+// actually appears, with the plain purchase mirror going out immediately
+// exactly as it did before 33 ever existed.
+// ... 2 CONTROL, 3 ENTERNODE, 4 SAVEFILE, 5 epoch, 6 CATDATA, 7 INVENTORY, 8 state hash drops facing + roster cap 254, 9 peer envelope + PEERS (up to 4 players), 10 state hash gains ElementList (tiles + equipment), 11 CURSOR, 12 state hash gains live-list membership and stops hashing departed cats, 13/14/15 CURSOR churn while the pointer moved from the board to the screen, 16 CURSOR carries the cursor-art index -- the peer's pointer is now the game's own texture for the state their game is in, 17 CHOICE -- event and level-up option choices, which is what replaces RUNSTATE, 18 the per-battle epoch COUNTER becomes a u64 battle_id -- the node seed both peers already share -- so battle identity survives a peer restarting, 19 CHOICE carries the node seed it was made on -- a held choice used to have no idea which node it belonged to and could surface on a later one, 20 RUNHIST (the run-history object the event roller reads) + NODEHASH (the meta layer finally gets the per-node check the battle layer has had per turn since version 5), 21 AIM -- the range/AOE tiles the other player is aiming at, drawn on this peer by the game's own Brain::DrawAbilityAOE; cosmetic like CURSOR and hashed by nothing, 22 AIM is read from the PLAYERBRAIN'S SELECTION (PlayerBrain+0x3D8/+0x358/+0x360) instead of the cached decision, and the receiver draws the RANGE tiles as well as the AOE -- not one byte of AimMsg moved, which is exactly the kind of change version 12 established has to bump anyway, 23 the range-tile call that came with 22 is REMOVED -- sub_140138A10 applies statuses rather than drawing, so mirroring it mutated the non-owning peer's simulation and cost a run; the bump exists so a peer still running 22 cannot join and do it, 24 the highlight is back and the tiles with it, but only ever called with sub_140151CE0 -- its apply_status half -- swallowed by T_HighlightRefresh and with the whole roster's cat state fenced across the call, 25 a Move aim also shows the ATTACK RANGE from the hovered square -- the game gets those tiles by displacing the cat and moving it back, so the receiver now makes two TacticsObject::Move calls per frame inside the same state fence; not one byte of AimMsg moved, version 12's rule again, 26 STATEDUMP -- on a hash mismatch each peer sends the per-cat table its own hash was taken over, so the log that halts also names the cat and the field instead of requiring two log files side by side, 27 SAVEFILE carries `fresh` -- whether the host is (re)starting a run from the save screen or catching a peer up. A host that goes back to the menu and picks a slot again starts a NEW run, and the client used to decline that save with "already in the run": the g.applied latch is per-PROCESS and the two sends were byte-identical, so nothing on the receiving side could tell them apart, and HOSTLEFT -- the other half of that story: `fresh` handles the host STARTING a run, HOSTLEFT handles it ENDING one. Both shipped in the same unreleased version, which is the only reason they share a number, 28 OWNERSHIP -- F2's persistent per-player cat ownership table, host -> client, whole, sent whenever it grows (a fresh join/reconnect counts as growth from the receiver's point of view even when the table itself did not change), 29 CATDATA and INVENTORY become SYMMETRIC (F5) -- either peer may send either message now, because F6 lets either peer locally equip their own cats and the run inventory/a cat's own data are things either side can change; INVENTORY also gains a seq field, a Lamport clock over the one genuinely shared resource (the bag), ties going to the host -- a peer still on 28 would ignore a CATDATA/INVENTORY the client sent and drift, and would misread the new trailing seq field as part of the next message, 30 FACE (F1.1) -- a cat's facing, committed OUTSIDE any ability decision (clicking to orient a cat with nothing selected) never rode any existing message: it is not the ability direction ActionMsg carries, and the aim-preview freeze (which owns Character+0x388 during a real decision) unconditionally reverts it, so a real player-initiated rotation was silently discarded on this peer and never reached the other at all -- invisible until an enemy's later backstab check read a facing the two peers disagreed on. Detected as a real, settled change to Character+0x388 for a LOCALLY-controlled cat once Brain::UpdateDecision returns (i.e. after the preview restore has already run, so this can never fire on preview noise) and sent like an input, not like CURSOR/AIM
 
 // A frame's payload may not exceed this. RUNSTATE (phase 5) is the only message
 // that will ever approach it; everything in phase 4 is under 128 bytes.
@@ -107,8 +163,8 @@ enum MsgType : uint8_t {
     MSG_CONTROL  = 8,   // both, per battle: this peer's half of the split
     MSG_ENTERNODE= 9,   // host -> client: the map node the host entered
     MSG_SAVEFILE =10,   // host -> client: the whole save file, bytes and all
-    MSG_CATDATA  =11,   // host -> client: one cat, serialized by the game itself
-    MSG_INVENTORY=12,   // host -> client: the whole run inventory
+    MSG_CATDATA  =11,   // EITHER DIRECTION since v29 (F5): one cat, serialized by the game itself
+    MSG_INVENTORY=12,   // EITHER DIRECTION since v29 (F5): the whole run inventory, now with a seq
     MSG_PEERS    =13,   // host -> each client: who is in the session, and who you are
     MSG_CURSOR   =14,   // both, while in a battle: the tile this peer is pointing at
     MSG_CHOICE   =15,   // host -> client: which option the host picked on a
@@ -122,6 +178,17 @@ enum MsgType : uint8_t {
                         // can print the actual diff instead of two log files
                         // that have to be lined up by hand
     MSG_HOSTLEFT =20,   // host -> client: the host is no longer in the run
+    MSG_OWNERSHIP=21,   // host -> client: F2's persistent per-player cat
+                        // ownership table, whole
+    MSG_FACE     =22,   // owning peer -> other: a cat's facing, committed
+                        // outside any ability decision (see kProtoVersion 30)
+    MSG_SCREENVOTE=23,  // either: F3.1 -- "I am ready to leave this screen"
+    MSG_SHOPBUY   =24,  // either: F3.1 -- "I bought this shop/chest item, buy it too"
+    MSG_LEVELUPTARGET=25, // either: F3.1 -- "my level-up screen's recipient is this cat"
+    MSG_CURSORPING=26,  // either: F4.2 -- "highlight my cursor for everyone else"
+                        // (NOT MSG_PING=7, an unrelated keepalive that carries
+                        // nothing on the transport level -- this is a gameplay/
+                        // social signal, at the same layer as CURSOR/AIM)
 };
 
 // A save file is a plain sqlite3 database (the shipped ones start with the
@@ -380,10 +447,18 @@ constexpr uint32_t kMaxInvBytes = 512u * 1024u;  // per bucket
 
 struct InventoryMsg {
     int32_t  coins = 0, food = 0, boxes = 0;
-    // FNV-1a over the scalars and all three blobs. Doubles as the host's
-    // change check, so an unchanged inventory costs three serializes and a
+    // FNV-1a over the scalars and all three blobs. Doubles as the sender's
+    // own change check, so an unchanged inventory costs three serializes and a
     // compare and sends nothing.
     uint64_t hash = 0;
+    // A Lamport clock over the ONE shared resource this message describes --
+    // added v29/F5 when the run inventory became a two-writer resource (F6
+    // lets either peer equip their own cats from the same bag). Whoever
+    // publishes stamps last-known-seq + 1; a receiver accepts only a strictly
+    // newer seq, ties going to the host -- see invsync_on_message. Without
+    // this a stale publish arriving after a fresher local change silently
+    // clobbers it: measured live 2026-09-05 as item duplication/vanishing.
+    uint32_t seq  = 0;
     uint32_t size[kInvBuckets] = {};
     uint8_t* data[kInvBuckets] = {};  // encode: borrowed. decode: owned.
 };
@@ -500,6 +575,149 @@ struct AimMsg {
     int32_t  tx = 0, ty = 0;   // target tile
     int32_t  dx = 0, dy = 0;   // direction
     char     gon[64]    = {};  // authored ability name -- the second identity
+};
+
+// F1.1, 2026-09-05 -- a cat's facing, committed by a click that orients it
+// with NOTHING selected (no ability, no move). Unlike AimMsg this is not
+// cosmetic: sub_14011C6F0 (the backstab test) reads Character+0x388 against
+// the direction a hit came from, so two peers disagreeing on this field take
+// different damage on the same swing. See kProtoVersion 30 and
+// mgmp_lockstep.cpp's lockstep_on_update_decision for how this is detected
+// (never on preview noise -- only a SETTLED change, read after the
+// aim-preview freeze has already restored whatever that touched).
+struct FaceMsg {
+    uint64_t battle_id = 0;   // which battle; a mismatch is dropped, not halted
+    uint8_t  cat       = 0;   // roster index of the cat being turned
+    int32_t  fx = 0, fy = 0;  // the new facing -- Character+0x388
+};
+
+// F3.1: "I clicked a vote-gated (or, for a treasure chest, FORCE-gated --
+// see below) screen button." See mgmp_screensync.h for the state machine
+// this drives -- Event_ExitButton and Shop_ExitButton (the latter shared
+// verbatim with the treasure-chest screen, confirmed live: ChestButton_alley
+// resolves to the same glaiel::Shop class) swallow the local click and wait
+// for `kind`'s counter to reach a threshold before either peer actually
+// fires the real click.
+//
+// NO SCREEN-INSTANCE TOKEN, DELIBERATELY. Unlike ChoiceMsg's node_seed, this
+// message does not need one: both peers reach a given event/shop screen at
+// the same map node (F3.2's node-sync already gets them there together), the
+// vote-gated buttons only exist while that screen is open, and the counter
+// resets locally the moment the tracked button's own live pointer changes to
+// a new instance (mgmp_screensync's per-frame tick) -- so a vote for a screen
+// that has already closed has nothing left to increment toward.
+//
+// THE THRESHOLD IS NOT ALWAYS "every peer voted", since 2026-09-06.
+// `kVoteChestOpen` (ChestButton_alley's own open/reveal click -- previously,
+// and incorrectly, routed through mgmp_shopmirror's per-slot purchase mirror,
+// which assumes an "iN" slot key a single chest button never actually
+// carries, so the mirror silently never fired) and `kVoteShopExit` WHEN THE
+// CURRENT MAP NODE IS A TREASURE NODE both require only ONE vote to fire --
+// the clicking peer's own vote already satisfies that threshold, so it fires
+// immediately on their side (indistinguishable from firing the real click
+// directly) while the OTHER peer's copy fires the moment this message
+// arrives. This is deliberately the SAME "one click, everyone follows"
+// shape as a shop purchase (see ShopBuyMsg below), not the ordinary
+// wait-for-everyone vote a real shop or an event still uses -- a chest's
+// contents are shared, one-shot state, not something either player has a
+// reason to browse at their own pace. `Shop_ExitButton` cannot be told apart
+// from a real shop's exit button by name or class (CLAUDE.md: no distinct
+// "close chest" button was ever seen live), so the threshold is chosen from
+// the CURRENT NODE'S TYPE (mgmp_follow's own `follow_current_node`/
+// `follow_node_info`, type 13 == "treasure") instead.
+struct ScreenVoteMsg {
+    uint8_t kind = 0;   // kVoteEvent, kVoteShopExit or kVoteChestOpen
+};
+
+constexpr uint8_t kVoteEvent     = 0;
+constexpr uint8_t kVoteShopExit  = 1;
+constexpr uint8_t kVoteChestOpen = 2;
+
+// F3.1: "I clicked Shop_BuyButton for this item, mirror it." See
+// mgmp_shopmirror.h for the full mechanism -- summary here because the
+// identity scheme is the interesting part. ChestButton_alley used to be
+// routed through here too, on the assumption its layout matched
+// Shop_BuyButton's -- WRONG, per-slot identity never worked for a chest
+// (there is only ever one), and the mirror silently never fired. Moved to
+// `kVoteChestOpen` in ScreenVoteMsg instead as of proto 35, which needs no
+// item identity at all.
+//
+// THE SHOP'S OWN STABLE SLOT KEY, NOT AN ARRAY INDEX WE COUNTED. Found live,
+// 2026-09-06, by dumping a real Shop_BuyButton object: Button+0xD0 holds a
+// short std::string ("i1", "i3", "i4" were seen live in a shop with one item
+// already sold) that is almost certainly the shop's own internal slot
+// identity -- unlike a position in whatever order buttons happen to be
+// ticked in a given frame, this survives an item being bought out from under
+// it. RESOLVE BY THIS KEY, VALIDATE BY NAME, the same pattern ChoiceMsg
+// settled on for the fourth time in this protocol (see ChoiceMsg's own header
+// note) -- `name` is the item's display name (Button+0x1B8, a UTF-16 buffer
+// this peer converts to UTF-8 for the wire), and a mismatch is shouted about
+// rather than trusted, because it means the two shops were NOT built the
+// same way (should not happen -- EnterNode's re-seed is what guarantees the
+// stock is identical -- but the whole point of validating is not assuming
+// that holds forever).
+//
+// NOT YET CROSS-PEER VERIFIED that "iN" is assigned in the SAME order on
+// both peers (only single-peer memory dumps have been taken so far) --
+// that is the residual risk this cross-check exists to catch, not a settled
+// fact.
+//
+// SENT IMMEDIATELY on the real click, with NO waiting -- a first version
+// tried delaying this send to also capture a resulting level-up screen's
+// recipient (see LevelUpTargetMsg below) and it was a real regression: an
+// ordinary purchase (no level-up at all, the overwhelming common case) only
+// mirrored after the whole watch window elapsed, turning an instant mirror
+// into a multi-second stall. The recipient fix is now a fully separate,
+// later message instead.
+struct ShopBuyMsg {
+    char slot[8]  = {};   // Button+0xD0's own string, e.g. "i1"
+    char name[64] = {};   // UTF-8 cross-check: the item's display name
+};
+
+// Either peer, whenever a NEW LevelUpScreen appears on THIS peer's own
+// screen: "my level-up screen's subject is this cat." Decoupled entirely
+// from ShopBuyMsg/the click-mirror flow -- see mgmp_shopmirror.h's header
+// note on why. `cat_id` is CatData+0x00, the same portable id catsync
+// already sends and resolves with catsync_resolve_by_id().
+//
+// WHY THIS EXISTS AT ALL. Some purchases (a rare candy) pick a recipient by
+// an internal random roll over "cats at the lowest level" rather than from
+// the click itself -- measured live, 2026-09-06: mirroring the BUY click
+// makes both peers roll INDEPENDENTLY, and each peer's LevelUpScreen opened
+// for a DIFFERENT cat. Rolling twice independently instead of reproducing
+// one result is exactly the class of bug this project's "replicate the
+// CHOICE, not the effect" rule exists to prevent (see ChoiceMsg's own header
+// note) -- this message is what lets the receiving peer correct its own
+// roll onto the one the buyer actually got, once both are known, in
+// whichever order they become known.
+//
+// SENT ON EVERY new LevelUpScreen, not just shop-purchase-triggered ones --
+// a receiver with no mismatching screen open just has nothing to correct,
+// so this is harmless to send unconditionally and needs no coupling to the
+// buy click's own timing at all.
+struct LevelUpTargetMsg {
+    uint64_t cat_id = 0;
+};
+
+// F4.2, 2026-09-06: "highlight my cursor on every other peer's screen" --
+// the user's own "look here" request. The sending peer's identity (the
+// envelope's `from`) plus `active` is the whole message -- it already draws
+// that peer's cursor every frame (mgmp_overlay.cpp), this just tells it to
+// draw that ONE peer's a bit larger/brighter, or to stop. Same "cosmetic,
+// hashed by nothing" class as CURSOR/AIM.
+//
+// HELD, NOT TIMED -- changed same day after the first version (a fixed
+// kCursorPingMs highlight window, fire-and-forget on the down-edge only)
+// shipped and the user asked for something else: highlighted for exactly as
+// long as cursor.ping_key is physically held, gone the instant it is
+// released, no lingering delay either way. So this is sent on BOTH edges
+// (`active=true` on down, `active=false` on up) rather than once -- a
+// dropped `active=false` would leave a peer's cursor stuck highlighted
+// forever, but CURSORPING rides the same reliable, in-order TCP stream
+// every other message does, so that failure mode needs an actual dropped
+// connection, not just a slow one.
+struct CursorPingMsg {
+    bool active = false;
 };
 
 struct CursorMsg {
@@ -694,6 +912,27 @@ struct SaveFileMsg {
     // sends are byte-identical without this field, hash included, so no amount
     // of comparison on the receiving side could have separated them.
     uint8_t  fresh = 0;
+
+    // WHETHER THE HOST IS CURRENTLY PLAYING, separate from `fresh`.
+    //
+    // A save can be freshly picked (or a genuine catch-up) while the host is
+    // sitting in the house rather than on the map -- measured live
+    // 2026-09-06: a save that puts the host straight in the house on load
+    // also drops a freshly-connecting client straight into that SAME house,
+    // where they can breed cats and place furniture that will never be
+    // synced (see CLAUDE.md: "Scope: the HOUSE is out"). `ready = 0` tells
+    // the client the file is here but must NOT be acted on yet;
+    // savefile_on_message leaves it unapplied and does not arm autoselect.
+    // The host remembers it sent a not-ready save (savefile.cpp's
+    // g.wait_for_run_signal) and republishes -- this time with ready = 1 --
+    // the moment its own map is confirmed ticking (mgmp_follow's host-side
+    // MapScreen::update tick), the same signal mgmp_leave's
+    // leave_consume_republish_due already uses for the sibling case (host
+    // resumes a run straight from the house mid-session, no fresh
+    // save-selection click). Default 1: a peer running the previous proto
+    // version that never sets this field must not accidentally hold every
+    // client forever.
+    uint8_t  ready = 1;
 };
 
 // Host -> client, once: the host has left the adventure.
@@ -717,6 +956,30 @@ struct SaveFileMsg {
 // breed, and will be a while".
 struct HostLeftMsg {
     char scene[32] = {};
+};
+
+// Matches mgmp_ownertable.h's kMaxOwnerSlots by value, not by shared symbol:
+// that header stays free of a dependency on the wire layer, the same way
+// mgmp_split.h does, so the cap is restated here rather than included.
+constexpr uint32_t kOwnershipSlots = 32;
+
+// Host -> client: F2's persistent per-player cat ownership table, whole.
+// See mgmp_ownertable.h for the growth rules and why this is safe to key on
+// POSITION rather than on a CatData id or a Character pointer.
+//
+// WHOLE TABLE, NOT A DELTA, for the same reason RUNHIST and INVENTORY are:
+// it is tiny (kOwnershipSlots bytes at most) and sending the lot costs
+// nothing, so there is no format for "here is slot 3" to get out of step
+// with the receiver's idea of how long the table already is.
+//
+// `count` only ever grows, on both ends -- an existing slot's owner never
+// changes once assigned (that is F2's whole requirement), so a client that
+// receives a table can simply overwrite its own local copy: there is no
+// older/newer ambiguity to resolve, unlike CATDATA or INVENTORY, where a
+// stale push arriving late would matter.
+struct OwnershipMsg {
+    uint32_t count = 0;
+    uint8_t  owner[kOwnershipSlots] = {};
 };
 
 // Host -> client: the run-history object at *(MewDirector+1424), whole.
@@ -971,6 +1234,7 @@ inline uint32_t enc_inventory(uint8_t* p, uint32_t cap, const InventoryMsg& m) {
     w.u8v(MSG_INVENTORY);
     w.i32v(m.coins); w.i32v(m.food); w.i32v(m.boxes);
     w.u64v(m.hash);
+    w.u32v(m.seq);
     // Every length first, then every payload. Keeping the sizes contiguous
     // lets the decoder validate the whole frame's arithmetic before it
     // allocates anything, so a garbled length cannot make it allocate one
@@ -989,6 +1253,7 @@ inline bool dec_inventory(Reader& r, InventoryMsg& m) {
     for (uint32_t i = 0; i < kInvBuckets; ++i) { m.data[i] = nullptr; m.size[i] = 0; }
     m.coins = r.i32v(); m.food = r.i32v(); m.boxes = r.i32v();
     m.hash  = r.u64v();
+    m.seq   = r.u32v();
     if (!r.ok) return false;
 
     uint32_t size[kInvBuckets] = {};
@@ -1064,6 +1329,44 @@ inline uint32_t enc_aim(uint8_t* p, uint32_t cap, const AimMsg& m) {
     return w.ok ? w.len : 0;
 }
 
+inline uint32_t enc_face(uint8_t* p, uint32_t cap, const FaceMsg& m) {
+    Writer w(p, cap);
+    w.u8v(MSG_FACE);
+    w.u64v(m.battle_id);
+    w.u8v(m.cat);
+    w.u32v((uint32_t)m.fx); w.u32v((uint32_t)m.fy);
+    return w.ok ? w.len : 0;
+}
+
+inline uint32_t enc_screenvote(uint8_t* p, uint32_t cap, const ScreenVoteMsg& m) {
+    Writer w(p, cap);
+    w.u8v(MSG_SCREENVOTE);
+    w.u8v(m.kind);
+    return w.ok ? w.len : 0;
+}
+
+inline uint32_t enc_shopbuy(uint8_t* p, uint32_t cap, const ShopBuyMsg& m) {
+    Writer w(p, cap);
+    w.u8v(MSG_SHOPBUY);
+    w.str(m.slot);
+    w.str(m.name);
+    return w.ok ? w.len : 0;
+}
+
+inline uint32_t enc_cursorping(uint8_t* p, uint32_t cap, const CursorPingMsg& m) {
+    Writer w(p, cap);
+    w.u8v(MSG_CURSORPING);
+    w.u8v(m.active ? 1 : 0);
+    return w.ok ? w.len : 0;
+}
+
+inline uint32_t enc_levelup_target(uint8_t* p, uint32_t cap, const LevelUpTargetMsg& m) {
+    Writer w(p, cap);
+    w.u8v(MSG_LEVELUPTARGET);
+    w.u64v(m.cat_id);
+    return w.ok ? w.len : 0;
+}
+
 inline uint32_t enc_enter_node(uint8_t* p, uint32_t cap, const EnterNodeMsg& m) {
     Writer w(p, cap);
     w.u8v(MSG_ENTERNODE);
@@ -1091,6 +1394,7 @@ inline uint32_t enc_savefile(uint8_t* p, uint32_t cap, const SaveFileMsg& m) {
     w.u8v(MSG_SAVEFILE);
     w.u32v(m.slot); w.u32v(m.size); w.u64v(m.hash); w.str(m.name);
     w.u8v(m.fresh);
+    w.u8v(m.ready);
     w.raw(m.data, m.size);
     return w.ok ? w.len : 0;
 }
@@ -1106,6 +1410,15 @@ inline uint32_t enc_hostleft(uint8_t* p, uint32_t cap, const HostLeftMsg& m) {
     Writer w(p, cap);
     w.u8v(MSG_HOSTLEFT);
     w.str(m.scene);
+    return w.ok ? w.len : 0;
+}
+
+inline uint32_t enc_ownership(uint8_t* p, uint32_t cap, const OwnershipMsg& m) {
+    if (m.count > kOwnershipSlots) return 0;
+    Writer w(p, cap);
+    w.u8v(MSG_OWNERSHIP);
+    w.u32v(m.count);
+    for (uint32_t i = 0; i < m.count; ++i) w.u8v(m.owner[i]);
     return w.ok ? w.len : 0;
 }
 
@@ -1234,6 +1547,18 @@ inline bool dec_peers(Reader& r, PeersMsg& v) {
     return saw_you;
 }
 
+inline bool dec_face(Reader& r, FaceMsg& m) {
+    m.battle_id = r.u64v();
+    m.cat       = r.u8v();
+    m.fx = (int32_t)r.u32v(); m.fy = (int32_t)r.u32v();
+    // Facing is a direction, observed as (0,0)/(1,0)/(0,1)/(-1,0) and never
+    // wider than a handful of units on this content -- loose bound, same
+    // spirit as dec_aim's dx/dy: a wild-but-bounded value writes a harmless
+    // number into Character+0x388 instead of the decoder trusting it blindly.
+    if (m.fx < -8 || m.fx > 8 || m.fy < -8 || m.fy > 8) return false;
+    return r.ok;
+}
+
 inline bool dec_aim(Reader& r, AimMsg& m) {
     m.battle_id  = r.u64v();
     m.cat        = r.u8v();
@@ -1274,6 +1599,28 @@ inline bool dec_cursor(Reader& r, CursorMsg& c) {
     return r.ok;
 }
 
+inline bool dec_screenvote(Reader& r, ScreenVoteMsg& m) {
+    m.kind = r.u8v();
+    return r.ok && (m.kind == kVoteEvent || m.kind == kVoteShopExit ||
+                    m.kind == kVoteChestOpen);
+}
+
+inline bool dec_shopbuy(Reader& r, ShopBuyMsg& m) {
+    r.str(m.slot, sizeof(m.slot));
+    r.str(m.name, sizeof(m.name));
+    return r.ok && m.slot[0] != '\0';
+}
+
+inline bool dec_levelup_target(Reader& r, LevelUpTargetMsg& m) {
+    m.cat_id = r.u64v();
+    return r.ok && m.cat_id != 0;
+}
+
+inline bool dec_cursorping(Reader& r, CursorPingMsg& m) {
+    m.active = r.u8v() != 0;
+    return r.ok;
+}
+
 inline bool dec_enter_node(Reader& r, EnterNodeMsg& m) {
     m.index = r.u32v(); m.node_count = r.u32v(); m.type = r.u32v(); m.seed0 = r.u64v();
     return r.ok;
@@ -1299,6 +1646,7 @@ inline bool dec_savefile(Reader& r, SaveFileMsg& m) {
     m.hash = r.u64v();
     r.str(m.name, sizeof(m.name));
     m.fresh = r.u8v();
+    m.ready = r.u8v();
     if (!r.ok) return false;
     if (m.size == 0 || m.size > kMaxSaveBytes) return false;
     if (r.pos + m.size > r.len) return false;
@@ -1312,6 +1660,13 @@ inline bool dec_savefile(Reader& r, SaveFileMsg& m) {
 
 inline bool dec_hostleft(Reader& r, HostLeftMsg& m) {
     r.str(m.scene, sizeof(m.scene));
+    return r.ok;
+}
+
+inline bool dec_ownership(Reader& r, OwnershipMsg& m) {
+    m.count = r.u32v();
+    if (!r.ok || m.count > kOwnershipSlots) return false;
+    for (uint32_t i = 0; i < m.count; ++i) m.owner[i] = r.u8v();
     return r.ok;
 }
 
@@ -1343,6 +1698,12 @@ inline const char* msg_name(uint8_t t) {
         case MSG_AIM:     return "AIM";
         case MSG_STATEDUMP: return "STATEDUMP";
         case MSG_HOSTLEFT: return "HOSTLEFT";
+        case MSG_OWNERSHIP: return "OWNERSHIP";
+        case MSG_FACE:    return "FACE";
+        case MSG_SCREENVOTE: return "SCREENVOTE";
+        case MSG_SHOPBUY: return "SHOPBUY";
+        case MSG_LEVELUPTARGET: return "LEVELUPTARGET";
+        case MSG_CURSORPING: return "CURSORPING";
         default:          return "?";
     }
 }

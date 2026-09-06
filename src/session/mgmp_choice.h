@@ -66,12 +66,34 @@
 // are the first suspects.
 //
 // ---------------------------------------------------------------------------
+// F6 (cahier-des-charges-mgmp-fork.md): WHO DECIDES IS NOT "THE HOST" ANY MORE
+// ---------------------------------------------------------------------------
+//
+// This shipped host-authoritative: the host's click always published, the
+// client's was always swallowed, whatever cat was involved. That is fine for
+// determinism (either peer's click resolves to the same effect) but wrong for
+// co-op ownership -- a client could never act on ITS OWN cats at all.
+//
+// BOTH SCREENS now decide per screen instead of per role. LevelUpScreen+160
+// names the cat a level-up is FOR; WorldEvent+296 (kEvt_Subject in the .cpp)
+// names the cat an event is about -- the latter promoted from "confirmed for
+// one command only" to "general subject field" on live evidence gathered
+// 2026-09-05 (two unrelated event archetypes, same offset, host and client
+// agreeing, different owners for the two events). Whichever peer owns that
+// cat is the one whose click publishes -- the other peer's is swallowed and
+// it waits for a CHOICE instead, exactly the same injection mechanism as
+// before, just no longer gated on g.is_client for either kind. An unresolved
+// owner falls back to the host, the same way it always behaved, rather than
+// ever leaving a screen with no decider at all.
+//
+// ---------------------------------------------------------------------------
 // THE TWO BOUNDARIES, WHICH ARE THE SAME SHAPE
 // ---------------------------------------------------------------------------
 //
 // Both screens keep their offered options in a 240-BYTE-STRIDE ARRAY and commit
 // through a single function, so each needs exactly one hook that does double
-// duty: capture the host's pick, swallow the client's.
+// duty: capture the DECIDER's pick (whoever owns the subject cat), swallow
+// the other peer's.
 //
 //              options array        commit                    injected by
 //   event      WorldEvent+224..232  sub_140937F30(capture)    calling it
@@ -130,6 +152,46 @@ void choice_on_event_update(void* world_event);
 void choice_on_level_update(void* level_screen);
 
 void choice_on_message(const ChoiceMsg& m);
+
+// F4 (cahier-des-charges-mgmp-fork.md): who the CURRENTLY CACHED level-up
+// screen's subject cat belongs to, for the ownership badge -- kNoOwner
+// (mgmp_ownertable.h) if there is no live screen right now, or its subject
+// cat's owner has not been decided.
+//
+// NOT level_screen_decider()'s answer. That one falls back to the host so a
+// screen never permanently deadlocks with no decider at all -- correct for
+// deciding who may click, wrong for a badge, which must not claim "the
+// host's cat" when the honest answer is "not decided yet".
+uint8_t choice_level_screen_owner();
+
+// F4-events: the event half of choice_level_screen_owner. See kEvt_Subject's
+// own header note in mgmp_choice.cpp for why WorldEvent+296 is now trusted
+// as a general subject field.
+uint8_t choice_event_screen_owner();
+
+// F3.1 shop-purchase-recipient fix (mgmp_shopmirror.h): the currently cached
+// LevelUpScreen*, recency-checked like choice_level_screen_owner(), or
+// nullptr. Used to detect a NEW screen appearing after a mirrored purchase
+// click, since some consumables (a rare candy) pick their recipient by an
+// internal random roll rather than from the click itself -- two
+// independently-fired clicks roll INDEPENDENTLY, so the actual chosen cat
+// has to be read here and carried across, not re-rolled on the other peer.
+void* choice_current_level_screen();
+
+// The raw value at `screen`'s subject CatData's own +0x00 -- NOT a pointer
+// comparison (see the CatData+0x00 caveat in project memory), read purely as
+// the same portable id catsync already sends over the wire and resolves
+// with catsync_resolve_by_id(). False if the screen or its subject cannot be
+// read.
+bool choice_screen_subject_raw_id(void* screen, uint64_t& out_id);
+
+// Overwrites `screen`'s subject pointer (LevelUpScreen+160) with `cat_data`.
+// For redirecting a level-up screen that opened for the WRONG cat (the local
+// roll picked someone other than the id the buying peer actually saw) onto
+// the right one before mgmp_choice's own option-choice sync engages. `cat_data`
+// must be a genuine CatData* already resolved on THIS peer (e.g. via
+// catsync_resolve_by_id) -- this does no resolution of its own.
+bool choice_force_level_screen_subject(void* screen, void* cat_data);
 
 // This peer has ENTERED the node with this seed. Called by mgmp_follow from
 // remember_node, on both peers, whenever the node actually changes.

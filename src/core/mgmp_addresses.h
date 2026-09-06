@@ -486,7 +486,21 @@ static const uint32_t kExpectedSizeOfImage = 0x156B000;
 // first call happens after all startup is done but before a single frame has
 // been simulated, which is early enough for every hook we care about. The only
 // thing that ordering costs is initSystems, which has already run by then.
-static const uint32_t kParkRva = 0x009A9D80;   // glaiel::ApplicationBase::FrameBegin
+// Re-derived 2026-09-06 after the FIRST game update this project has seen
+// (installed Mewgenics.exe SHA256 no longer matches CLAUDE.md's pinned
+// build). The loader has no scanning fallback -- unlike every DLL-side
+// target, which self-heals via mgmp_resolve's full-.text scan -- because it
+// runs before the DLL exists at all, so this one constant is a hard
+// dependency and does not get the self-healing everything else gets.
+// Re-derived by statically reading the new RVA straight out of the shipped
+// PE (capstone + a manual .pdata/section-table walk, no IDA): the DLL's own
+// signature scan already found FrameBegin's new location at runtime
+// (mgmp_resolve's `target FRAME MOVED: rva 0x009A9D80 -> 0x009B7870`); this
+// just confirms that location's own first 16 bytes for the loader's
+// pre-injection prologue check. kParkSig is BYTE-IDENTICAL to before --
+// FrameBegin itself did not change, only where it lives -- so only kParkRva
+// needed updating.
+static const uint32_t kParkRva = 0x009B7870;   // glaiel::ApplicationBase::FrameBegin
 static const uint8_t  kParkSig[16] = {
     0x48,0x8B,0xC4,0x48,0x89,0x58,0x10,0x48,0x89,0x70,0x18,0x48,0x89,0x78,0x20,0x55
 };
@@ -1007,6 +1021,21 @@ constexpr const char kBtnName_MainMenuPlay[] = "MainMenu_Button_Play";
 // QuitToMenu, QuitToDesktop, GiveUp}.
 constexpr const char kBtnName_PauseQuitToMenu[] = "Button_PauseMenu_QuitToMenu";
 
+// Seen live on the client's inventory screen (2026-09-05, the reverted
+// auto-close-and-reopen experiment -- see mgmp_hooks.cpp's h_ButtonUpdate and
+// mgmp_follow.h). Generic enough a name that other modal screens plausibly
+// reuse the same one; not otherwise confirmed for any screen but the
+// inventory.
+constexpr const char kBtnName_Close[] = "CloseButton";
+
+// Every map node's button shares this literal name (confirmed live,
+// 2026-09-06 -- diag_buttons saw it at the same fingerprint across many
+// distinct node pointers). Used to block a client's own node-selection
+// click at the source: EnterNode was already refused on the client, but
+// nothing stopped MapNode::Click itself from running first and visibly
+// selecting/confirming a node the host never chose.
+constexpr const char kBtnName_MapNode[] = "Map_Node";
+
 // --- the loaded-scene list ---------------------------------------------------
 //
 // READ, NEVER CALLED. glaiel's own scene lookup is sub_1409CA630(Director*,
@@ -1045,6 +1074,12 @@ constexpr const char kScene_House      [] = "House";
 constexpr const char kScene_MainMenu   [] = "MainMenu";
 constexpr const char kScene_SaveSelect [] = "SaveSelectionScreen";
 
+// Not one of the three above -- "Cutscene" does not mean "out of a run" (a
+// mid-adventure cutscene is not a departure). Used only by mgmp_cutscene's
+// auto-skip, via leave_scene_is_loaded, which is why it lives here next to
+// the scene name this module already reads the same way.
+constexpr const char kScene_Cutscene   [] = "Cutscene";
+
 // glaiel::Brain -- the Character the brain drives. Read off the two sites in
 // Brain::UpdateDecision described in the PREVIEWFACE target above: one passes
 // [rdi+38h] straight to Character::Face, the other walks it +0x60 -> +0x48,
@@ -1079,7 +1114,22 @@ constexpr uint32_t kRva_MouseCache = 0x012F2E80;
 // Writing the slot is both simpler and more honest than hooking anything. It is
 // the indirection SDL_DYNAPI exists to provide, the table is in .data and
 // already writable, and "call the previous value" is the trampoline for free.
-constexpr uint32_t kRva_SdlSwapSlot = 0x012DE650;
+//
+// Re-derived 2026-09-06 after the game update broke the pinned value below
+// (confirmed live: the overlay hook landed inside an unrelated .rdata
+// string, "...DL_GL_Ge...", instead of a function pointer -- see CLAUDE.md's
+// "SDL3 is statically linked..." section for the full writeup). Found with
+// NO IDA and NO debugger (a real debugger attach killed the host process
+// outright mid-session -- see CLAUDE.md, do not retry that): the chain was
+// GDI32.dll!SwapBuffers (exactly one call site in the whole image) -> its
+// enclosing function -> the .rdata store of that address into a video
+// device's +0x1C8 slot -> the one place in .text that dispatches through
+// +0x1C8 -> confirmed live to be reachable from FrameEnd's own per-frame
+// window-handle read. kParkSig-style byte identity was not re-checked here
+// (the whole point of a DYNAPI slot is that it holds a RUNTIME-installed
+// pointer, not a static byte pattern), but the full call chain to
+// SwapBuffers was independently re-verified end to end.
+constexpr uint32_t kRva_SdlSwapSlot = 0x012E7650;
 
 // THE MOUSE AND THE VIEWPORT ARE NOT THE SAME RULER, and these two slots are
 // how the overlay finally stopped guessing at the conversion.
@@ -1117,8 +1167,17 @@ constexpr uint32_t kRva_SdlSwapSlot = 0x012DE650;
 //
 //   SDL_GetWindowSize          @ 0x140B9CF10   jmp cs:off_1412DF170
 //   SDL_GetWindowSizeInPixels  @ 0x140B9CF20   jmp cs:off_1412DF178
-constexpr uint32_t kRva_SdlGetWindowSizeSlot   = 0x012DF170;
-constexpr uint32_t kRva_SdlGetWindowSizePxSlot = 0x012DF178;
+//
+// Re-derived 2026-09-06, same session/method as kRva_SdlSwapSlot above.
+// Found via FrameEnd's own call to SDL_GetWindowSizeInPixels (twice, with
+// two different output-pointer pairs) -- its real implementation reads the
+// window's logical size then multiplies by a per-display scale factor
+// (mulss against a float at [display+0x10]) before converting back to int,
+// which is what distinguishes it from GetWindowSize. GetWindowSize's slot
+// sits exactly 8 bytes earlier, same relative offset as the original build;
+// its real implementation just reads window+0x20/+0x24 directly, no scaling.
+constexpr uint32_t kRva_SdlGetWindowSizeSlot   = 0x012E8170;
+constexpr uint32_t kRva_SdlGetWindowSizePxSlot = 0x012E8178;
 
 // --- the game's own mouse cursor -------------------------------------------
 //

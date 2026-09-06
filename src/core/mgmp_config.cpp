@@ -334,6 +334,10 @@ void config_load(const wchar_t* dll_dir) {
         read_vkey(*ui, "key",     g_cfg.ui_key);
     }
 
+    if (const json* cursor = member(j, "cursor")) {
+        read_vkey(*cursor, "ping_key", g_cfg.cursor_ping_key);
+    }
+
     if (const json* d = member(j, "debug")) {
         read_bool(*d, "follow",          g_cfg.net_follow);
         read_bool(*d, "join_barrier",    g_cfg.net_join_barrier);

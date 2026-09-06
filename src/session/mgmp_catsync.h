@@ -97,4 +97,38 @@ void catsync_on_message(const CatDataMsg& m);
 // battle screen, and it is still in time for whatever the node opens.
 void catsync_apply_pending(const char* why);
 
+// Resolves a CatData+0x00 id to this peer's OWN live CatData* via the run's
+// registry -- the same by_id() call catsync_on_message uses. Exported for
+// mgmp_shopmirror.h's recipient-redirect fix: a purchase's OWN effect (e.g. a
+// level-up) can pick its target by an internal random roll, which two
+// independently-fired mirrored clicks would repeat INDEPENDENTLY rather than
+// reproduce -- so the actual chosen cat has to cross the wire as this id and
+// be looked up here, not re-rolled. Returns nullptr if unresolved (no run
+// loaded, or the id is not in this peer's roster -- the two runs are not the
+// same run).
+void* catsync_resolve_by_id(uint64_t id);
+
+// The inverse: given a live CatData* on THIS peer, find its portable id from
+// the run's own id array (MewDirector+1468/1472) -- the SAME source
+// catsync_publish's own `id` comes from, found by resolving each one through
+// by_id() until the result's POINTER matches `cat_data`. This is the only
+// correct way to get a portable id from a pointer: dereferencing
+// CatData+0x00 directly does NOT give it -- measured live, 2026-09-04 (see
+// level_screen_decider's own comment a few lines up in mgmp_choice.cpp) that
+// offset holds a heap-pointer-shaped value, not a stable per-cat id, and two
+// UNRELATED CatData pointers were once observed to read the same value there
+// (mgmp_shopmirror's level-up-recipient fix originally used the raw
+// dereference and was confirmed live, 2026-09-06, to occasionally desync
+// again for exactly this reason). Returns false if the run cannot be read or
+// no id in it resolves to this exact pointer.
+bool catsync_id_for(const void* cat_data, uint64_t& out_id);
+
+// Fills `out_ids` (capacity `max`) with every cat id in the run and sets
+// `*out_count`; returns false (count left at 0) if no run is loaded yet. The
+// same id list catsync_publish already walks (MewDirector+1468/+1472) --
+// exposed for mgmp_invlock's per-frame equip-slot integrity poll (F6), which
+// has to watch every cat in the run, not just whichever one happens to be on
+// screen.
+bool catsync_run_cat_ids(uint64_t* out_ids, uint32_t max, uint32_t* out_count);
+
 } // namespace mgmp

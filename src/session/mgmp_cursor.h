@@ -92,6 +92,31 @@ void cursor_shutdown();
 // it touches either, and does nothing at all when the session is not Ready.
 void cursor_on_status_menu(void* status_menu);
 
+// F4.1, 2026-09-05: the off-battle half. Called from TWO places: the map
+// tick (follow_map_update) and, so this keeps working under a modal screen
+// like the inventory or pause menu where MapScreen::update simply does not
+// run (measured live), from h_ButtonUpdate -- gated there on
+// !lockstep_in_battle() so it never fights cursor_on_status_menu for the
+// same outbound throttle state. There is no tactics grid off battle, so this
+// never has a tile to send (on_board stays 0) and there is no "whose turn"
+// concept, so owns_turn is always 1 -- full alpha, matching the game having
+// nothing to dim against. The screen-space pointer (mgmp_overlay.cpp)
+// already draws regardless of context; the tile reticle (this file's own
+// draw_peer) only ever draws a message with on_board set, so it stays
+// silent here by construction. Safe to call once per button per frame:
+// unlike calling into the game's own serialization, this only reads a
+// cached float pair and enqueues a network send.
+void cursor_on_map_tick();
+
+// Whether cursor_on_status_menu found a live battle grid within the last
+// ~200ms -- i.e. a StatusMenu is genuinely ticking right now. This is what
+// h_ButtonUpdate should gate cursor_on_map_tick on, NOT lockstep_in_battle():
+// that flag answers "has a roster been snapshotted and not yet replaced",
+// which stays true for the rest of the session after the first fight,
+// including on the level-up screen, the map, shops and the inventory. See
+// the fix note on cursor_on_map_tick's definition for the bug this replaced.
+bool cursor_recently_on_board();
+
 // From the lockstep pump. Records where one peer is pointing; the drawing
 // happens on the next StatusMenu::update, not here.
 void cursor_on_message(uint8_t from, const CursorMsg& c);

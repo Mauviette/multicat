@@ -243,6 +243,18 @@ foreach ($peer in 'host', 'client') {
 
     $cfg.log = "mgmp_$peer.log"
 
+    # The pre-launch connection dialog (mgmp_loader_dialog) must never show
+    # here -- both peers' roles are already decided above, and a human is not
+    # standing by to click through two modal popups. REPLACED wholesale,
+    # never mutated in place: `$cfg.launcher.enabled = $false` throws
+    # whenever the property does not already exist with that exact shape --
+    # measured live, a base config with a bare `"launcher": {}` (the
+    # loader's own dialog can write that shape, and did) broke this the
+    # first time a real launcher-modified config was fed back in here.
+    # Add-Member -Force overwrites either a missing property or an existing
+    # one of the wrong shape identically, so there is only one path to test.
+    $cfg | Add-Member -NotePropertyName launcher -NotePropertyValue ([pscustomobject]@{ enabled = $false }) -Force
+
     $cfg.net.role = $peer
     $cfg.net.addr = $Addr
     $cfg.net.port = $Port

@@ -9,11 +9,14 @@
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
 #include "mgmp_follow.h"   // follow_on_map
+#include "mgmp_leave.h"    // leave_in_run -- whether THIS publish should be ready=1
 // A slot click starts a run, which makes the three per-run dedupe caches stale.
 // See the block in savefile_on_slot_click.
 #include "mgmp_catsync.h"
 #include "mgmp_invsync.h"
 #include "mgmp_runhist.h"
+#include "mgmp_ownership.h"
+#include "mgmp_mainmenulock.h"   // the injected-click guard around g.button_click
 
 #include <windows.h>
 #include <shlobj.h>
@@ -95,6 +98,33 @@ bool read_slot_names(const void* ss, Names& out) {
 // guessing it. Exactly one such directory exists in practice; if several ever
 // do, the most recently written one is the live account, and the choice is
 // logged either way.
+//
+// "Most recently written" means the newest FILE inside <account>\saves, not the
+// account DIRECTORY's own timestamp. NTFS only bumps a directory's own
+// LastWriteTime when an entry is added, removed or renamed directly inside
+// it -- overwriting steamcampaign02.sav in place does not touch the mtime of
+// the account folder two levels up. Measured 2026-09-04: a dormant test
+// account whose folder happened to be touched once in February compared as
+// "newer" than the account with a save written minutes earlier, so every save
+// this module looked for was "not on disk yet" in a directory that was never
+// going to receive it -- the file was landing in the OTHER account's folder
+// the whole time.
+FILETIME newest_file_time(const wchar_t* dir) {
+    FILETIME newest{};
+    wchar_t glob[MAX_PATH];
+    _snwprintf_s(glob, _TRUNCATE, L"%s\\*", dir);
+
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(glob, &fd);
+    if (h == INVALID_HANDLE_VALUE) return newest;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (CompareFileTime(&fd.ftLastWriteTime, &newest) > 0) newest = fd.ftLastWriteTime;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return newest;
+}
+
 bool resolve_save_dir(wchar_t* out, size_t out_len) {
     out[0] = 0;
     wchar_t appdata[MAX_PATH] = {};
@@ -138,9 +168,10 @@ bool resolve_save_dir(wchar_t* out, size_t out_len) {
         if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) continue;
 
         ++found;
-        if (found == 1 || CompareFileTime(&fd.ftLastWriteTime, &best_time) > 0) {
+        FILETIME cand_time = newest_file_time(cand);
+        if (found == 1 || CompareFileTime(&cand_time, &best_time) > 0) {
             wcscpy_s(best, cand);
-            best_time = fd.ftLastWriteTime;
+            best_time = cand_time;
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -269,6 +300,14 @@ struct State {
     const void** director_slot = nullptr;
     bool     said_no_flush = false;
     bool     said_mid_node = false;
+
+    // Set whenever a publish went out with ready=0 (the host was sitting in
+    // the house, not on the map, at the moment it sent). Consumed by
+    // savefile_on_host_map_tick, from mgmp_follow's host-side MapScreen tick,
+    // the first time the map is confirmed ticking afterward -- the same
+    // "wait for the real signal, not the screen that merely isn't an
+    // out-scene" discipline mgmp_leave's own republish trigger follows.
+    bool     wait_for_run_signal = false;
 
     // --- client ---
     uint8_t* blob      = nullptr;
@@ -491,6 +530,11 @@ bool publish(uint8_t to, bool fresh) {
     m.size  = size;
     m.hash  = savefile_hash(data, size);
     m.fresh = fresh ? 1 : 0;
+    // Is the host actually PLAYING, or sitting in the house? A save that
+    // resumes straight into the house is common (any player between
+    // adventures), and a client that applies it immediately follows the host
+    // there -- see the field's own comment in mgmp_proto.h.
+    m.ready = leave_in_run() ? 1 : 0;
     strncpy_s(m.name, g.name, _TRUNCATE);
     m.data = data;
 
@@ -499,6 +543,13 @@ bool publish(uint8_t to, bool fresh) {
     if (!ok) {
         log_line("SAVEFILE", "!! failed to send %s (%u bytes)", g.name, size);
         return false;
+    }
+
+    if (!m.ready) {
+        g.wait_for_run_signal = true;
+        log_line("SAVEFILE", "   (ready=0 -- the host is not currently on the map; "
+                             "a waiting client will hold this file until a "
+                             "republish says otherwise)");
     }
 
     if (to == kNoPeer)
@@ -661,6 +712,43 @@ void savefile_catchup(uint8_t peer) {
     publish(peer, /*fresh=*/false);
 }
 
+void savefile_republish() {
+    ensure_state();
+    if (!g.on || g.is_client) return;
+    if (!g.have_slot) return;      // never chose a slot in this process -- nothing to send
+    if (!net_active()) return;
+
+    // SAME INVALIDATION AS A FRESH SLOT CLICK (savefile_on_slot_click), for the
+    // same reason: the run being resumed may not be the one these caches were
+    // built for (a game over can be followed by a brand new adventure, not
+    // just a continuation), and the worst case of forgetting them is one
+    // redundant push at the next node.
+    catsync_forget();
+    invsync_forget();
+    runhist_forget();
+    ownership_forget();
+    ownership_publish("host resumed a run from the house");
+
+    g.published     = false;
+    g.publish_tries = 0;
+    g.click_mtime   = 0;
+
+    log_line("SAVEFILE", "the host resumed a run without a fresh save-selection "
+                         "click (most likely straight from the house) -- "
+                         "republishing '%s' so a client waiting on the main menu "
+                         "has something to catch", g.name);
+}
+
+void savefile_on_host_map_tick() {
+    ensure_state();
+    if (!g.on || g.is_client) return;
+    if (!g.wait_for_run_signal) return;
+    g.wait_for_run_signal = false;
+    log_line("SAVEFILE", "the map is ticking -- republishing so a waiting client "
+                         "can stop waiting");
+    savefile_republish();
+}
+
 void savefile_pump() {
     ensure_state();
 
@@ -780,6 +868,14 @@ bool savefile_on_slot_click(void* ss, int slot) {
     catsync_forget();
     invsync_forget();
     runhist_forget();
+    ownership_forget();
+    // Unlike the three above, OWNERSHIP is also consumed LOCALLY -- this
+    // peer's own inventory screen, not just the network -- and a player can
+    // open it before ever entering a node. Without publishing here too, the
+    // table stayed empty until the next "entering a node" burst, and F6's
+    // greying had nothing to check against for that whole stretch: reported
+    // 2026-09-04, "why does it need a battle first".
+    ownership_publish("host chose a save slot");
 
     log_line("SAVEFILE", "host chose slot %u '%s' -- publishing it and forgetting "
                          "the per-run cat/inventory/history caches, because this "
@@ -856,6 +952,23 @@ void savefile_on_message(const SaveFileMsg& m) {
                      "!! this peer is INSIDE a run and a save can only be applied "
                      "from the save-selection screen -- quit to the main menu and "
                      "the host's new run will load on its own");
+    }
+
+    // NOT YET -- the host is sitting in the house (or a menu), not on the
+    // map. See SaveFileMsg::ready in mgmp_proto.h. Deliberately does not
+    // store the blob: a republish resends the whole file once the host's map
+    // is confirmed ticking (savefile_on_host_map_tick), so there is nothing
+    // here worth keeping in the meantime, and nothing here can go stale.
+    // savefile_autoselect's own existing "waiting for the host to choose a
+    // save file" line covers what the player sees in the meantime -- this
+    // peer simply never learns a save is pending until the real one arrives.
+    if (!m.ready) {
+        log_line("SAVEFILE", "<- host's save: slot %u '%s', %u bytes, hash %016llx "
+                             "-- NOT applying yet: the host is not currently on "
+                             "the map. Waiting for the host to actually start a "
+                             "run before following.",
+                 m.slot, m.name, m.size, (unsigned long long)h);
+        return;
     }
 
     if (g.blob) free(g.blob);
@@ -1044,7 +1157,14 @@ void savefile_on_button_update(void* button) {
     // force = 0, exactly as Button::update calls it. See the C_ButtonClick note
     // in mgmp_addresses.h: forcing would bypass a guard the game set for a
     // reason and would hide a refusal we want to hear about.
+    //
+    // Wrapped: mgmp_mainmenulock hooks this exact function to stop a HUMAN
+    // client from pressing Play, and MinHook patches the function itself
+    // rather than a call site, so this call lands in that hook too. The flag
+    // is what tells it "this one is ours" -- see mgmp_mainmenulock.h.
+    mainmenulock_begin_injected_click();
     g.button_click(button, false);
+    mainmenulock_end_injected_click();
 }
 
 } // namespace mgmp

@@ -14,6 +14,7 @@
 #include "mgmp_replay.h"
 #include "mgmp_session.h"
 #include "mgmp_ui.h"
+#include "mgmp_cutscene.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -136,6 +137,7 @@ DWORD WINAPI init_thread(LPVOID) {
     // everything below it does not need hook_framebegin, which net_role forces
     // on. That is what lets it come up in a plain single-player launch.
     ui_init();
+    cutscene_init();
 
     // Phase 4. Started before the hooks so the frame hook has somewhere to pump
     // to on its very first call, but it opens no socket unless net_role names

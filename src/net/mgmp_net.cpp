@@ -158,6 +158,11 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_CONTROL: return dec_control(r, m.control);
         case MSG_CURSOR:  return dec_cursor(r, m.cursor);
         case MSG_AIM:     return dec_aim(r, m.aim);
+        case MSG_FACE:    return dec_face(r, m.face);
+        case MSG_SCREENVOTE: return dec_screenvote(r, m.screenvote);
+        case MSG_SHOPBUY: return dec_shopbuy(r, m.shopbuy);
+        case MSG_LEVELUPTARGET: return dec_levelup_target(r, m.levelup_target);
+        case MSG_CURSORPING: return dec_cursorping(r, m.cursorping);
         case MSG_ENTERNODE: return dec_enter_node(r, m.enter_node);
         case MSG_CHOICE:    return dec_choice(r, m.choice);
         case MSG_SAVEFILE: return dec_savefile(r, m.savefile);
@@ -167,6 +172,7 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_STATEDUMP: return dec_statedump(r, m.statedump);
         case MSG_NODEHASH:  return dec_nodehash(r, m.nodehash);
         case MSG_HOSTLEFT:  return dec_hostleft(r, m.hostleft);
+        case MSG_OWNERSHIP: return dec_ownership(r, m.ownership);
         case MSG_PEERS:   return dec_peers(r, m.peers);
         case MSG_HALT:    return dec_halt(r, m.halt);
         case MSG_REFUSE:  r.str(m.refuse, sizeof(m.refuse)); return r.ok;
@@ -202,9 +208,14 @@ bool send_framed(SOCKET s, uint8_t from, const uint8_t* payload, uint32_t len) {
 // Which messages the host passes on to the other clients.
 //
 // Only the ones a CLIENT can author and another client needs. Everything else
-// is either host-authored and already going to everyone (SAVEFILE, CATDATA,
-// INVENTORY, ENTERNODE, PEERS, WELCOME) or strictly point to point (HELLO,
-// REFUSE). Relaying a host-authored message would deliver it twice.
+// is either host-authored and already going to everyone (SAVEFILE, ENTERNODE,
+// PEERS, WELCOME), strictly point to point (HELLO, REFUSE), or -- CATDATA and
+// INVENTORY since F5/v29 -- peer-authored but not yet relayed: either peer may
+// send them now (see mgmp_catsync.h/mgmp_invsync.h), but with only two players
+// confirmed in scope (cahier-des-charges-mgmp-fork.md) there is no THIRD
+// client for a relay to reach, so this is accurate for the supported topology
+// and would need revisiting alongside any future 3-4 player work. Relaying a
+// host-authored message would deliver it twice.
 bool relayed(uint8_t type) {
     switch (type) {
         case MSG_ACTION:
@@ -214,11 +225,27 @@ bool relayed(uint8_t type) {
         // AIM, like CURSOR, is authored by whichever peer is aiming and is for
         // everyone else to look at.
         case MSG_AIM:
+        // FACE is authored by whichever peer controls the cat, same shape as
+        // ACTION -- a real input, not a cosmetic broadcast, but still peer-
+        // authored rather than host-authored.
+        case MSG_FACE:
         case MSG_HALT:
         // NODEHASH is symmetric -- every peer authors its own -- so with more
         // than two players a client's has to reach the other clients, exactly
         // like the per-turn HASH above it.
         case MSG_NODEHASH:
+        // SCREENVOTE is symmetric too -- either peer's real click votes -- so
+        // a client's vote has to reach the other clients with more than two
+        // players, same reasoning as NODEHASH above it.
+        case MSG_SCREENVOTE:
+        // SHOPBUY is peer-authored too (whichever peer bought), same relay
+        // reasoning as SCREENVOTE just above.
+        case MSG_SHOPBUY:
+        // LEVELUPTARGET is peer-authored too, same relay reasoning.
+        case MSG_LEVELUPTARGET:
+        // CURSORPING is authored by whichever peer pressed the key and is for
+        // everyone else to see, same shape as CURSOR/AIM above.
+        case MSG_CURSORPING:
             return true;
         default:
             return false;
@@ -637,8 +664,14 @@ bool net_send_action (const ActionMsg& a) { MGMP_SEND_WITH(enc_action,  a); }
 bool net_send_hash   (const HashMsg& h)   { MGMP_SEND_WITH(enc_hash,    h); }
 bool net_send_halt   (const HaltMsg& h)   { MGMP_SEND_WITH(enc_halt,    h); }
 bool net_send_control(const ControlMsg& c) { MGMP_SEND_WITH(enc_control, c); }
+bool net_send_ownership(const OwnershipMsg& m) { MGMP_SEND_WITH(enc_ownership, m); }
 bool net_send_cursor (const CursorMsg& c)  { MGMP_SEND_WITH(enc_cursor,  c); }
 bool net_send_aim    (const AimMsg& m)     { MGMP_SEND_WITH(enc_aim,     m); }
+bool net_send_face   (const FaceMsg& m)    { MGMP_SEND_WITH(enc_face,    m); }
+bool net_send_screenvote(const ScreenVoteMsg& m) { MGMP_SEND_WITH(enc_screenvote, m); }
+bool net_send_shopbuy(const ShopBuyMsg& m) { MGMP_SEND_WITH(enc_shopbuy, m); }
+bool net_send_levelup_target(const LevelUpTargetMsg& m) { MGMP_SEND_WITH(enc_levelup_target, m); }
+bool net_send_cursorping(const CursorPingMsg& m) { MGMP_SEND_WITH(enc_cursorping, m); }
 bool net_send_enter_node(const EnterNodeMsg& m) { MGMP_SEND_WITH(enc_enter_node, m); }
 bool net_send_choice(const ChoiceMsg& m) { MGMP_SEND_WITH(enc_choice, m); }
 bool net_send_nodehash(const NodeHashMsg& m) { MGMP_SEND_WITH(enc_nodehash, m); }

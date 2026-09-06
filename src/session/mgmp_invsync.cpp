@@ -3,6 +3,8 @@
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
 #include "mgmp_hooks.h"     // hooks_is_live, for the two blob hooks this needs
+#include "mgmp_lockstep.h"  // lockstep_in_battle -- see invsync_on_message, F5
+#include "mgmp_follow.h"    // follow_on_map -- see the new hold branch below
 #include "mgmp_config.h"
 #include "mgmp_tuning.h"
 #include "mgmp_log.h"
@@ -92,6 +94,11 @@ struct State {
     uint64_t last_hash = 0;
     bool     has_last  = false;
 
+    // F5: the Lamport clock over the shared bag. The highest seq this peer has
+    // either sent or accepted from the other side -- see invsync_publish and
+    // the accept rule in invsync_on_message/apply_now.
+    uint32_t seq = 0;
+
     // --- the deferred apply (client) ---
     //
     // A copy, because the frame that carried it is released the instant the
@@ -99,8 +106,22 @@ struct State {
     bool     pend_have = false;
     int32_t  pend_coins = 0, pend_food = 0, pend_boxes = 0;
     uint64_t pend_hash = 0;
+    uint32_t pend_seq  = 0;
     uint32_t pend_size[kInvBuckets] = {};
     uint8_t* pend_data[kInvBuckets] = {};
+
+    // F6, 2026-09-06: a PERSISTENT copy of the last successfully applied
+    // inventory (as opposed to `pend_*` above, which is transient and freed
+    // the moment it's applied). See invsync_reapply_last_good -- mgmp_invlock
+    // uses this to undo the bag-side half of a client's blocked equip/unequip
+    // attempt, which a raw byte revert of the cat's own equip slot cannot
+    // reach on its own.
+    bool     good_have = false;
+    int32_t  good_coins = 0, good_food = 0, good_boxes = 0;
+    uint64_t good_hash = 0;
+    uint32_t good_seq  = 0;
+    uint32_t good_size[kInvBuckets] = {};
+    uint8_t* good_data[kInvBuckets] = {};
 
     uint32_t pushed = 0, applied = 0, skipped = 0;
     uint32_t deferred = 0, coalesced = 0;
@@ -320,6 +341,8 @@ void invsync_init() {
 void invsync_shutdown() {
     for (uint32_t i = 0; i < kInvBuckets; ++i) { free(g.pend_data[i]); g.pend_data[i] = nullptr; }
     g.pend_have = false;
+    for (uint32_t i = 0; i < kInvBuckets; ++i) { free(g.good_data[i]); g.good_data[i] = nullptr; }
+    g.good_have = false;
     if (!g.announced) return;
     log_line_lvl(LogLevel::Trace, "INVSYNC",
              "done: %u pushed, %u applied, %u unchanged, "
@@ -427,14 +450,14 @@ bool invsync_intercept_load(void* key, void* bs) {
 // push, and a peer that just arrived has not seen it.
 void invsync_forget() {
     ensure_state();
-    if (!g.on || g.is_client) return;
+    if (!g.on) return;
     g.has_last  = false;
     g.last_hash = 0;
 }
 
 void invsync_publish(const char* why) {
     ensure_state();
-    if (!g.on || g.is_client || !net_active()) return;
+    if (!g.on || !net_active()) return;
 
     RunInv ri{};
     if (!run_inv(ri)) {
@@ -481,20 +504,27 @@ void invsync_publish(const char* why) {
 
         if (g.has_last && g.last_hash == h) {
             ++g.skipped;
-        } else if (net_send_inventory(m)) {
-            g.last_hash = h;
-            g.has_last  = true;
-            ++g.pushed;
-            log_line("INVSYNC", "-> inventory %016llx: %u/%u/%u bytes "
-                                "(backpack/storage/trash), %d coins %d food "
-                                "%d boxes (%s)",
-                     (unsigned long long)h, m.size[0], m.size[1], m.size[2],
-                     m.coins, m.food, m.boxes, why);
+        } else {
+            // F5: stamp the Lamport clock only NOW, on the send that actually
+            // goes out -- not earlier, so a run of skipped (unchanged)
+            // publishes never burns seq numbers it does not need to.
+            m.seq = ++g.seq;
+            if (net_send_inventory(m)) {
+                g.last_hash = h;
+                g.has_last  = true;
+                ++g.pushed;
+                log_line("INVSYNC", "-> inventory %016llx seq=%u: %u/%u/%u bytes "
+                                    "(backpack/storage/trash), %d coins %d food "
+                                    "%d boxes (%s)",
+                         (unsigned long long)h, m.seq, m.size[0], m.size[1], m.size[2],
+                         m.coins, m.food, m.boxes, why);
+            }
         }
     }
 
     for (uint32_t i = 0; i < kInvBuckets; ++i) free(m.data[i]);
 }
+
 
 // --- client -----------------------------------------------------------------
 
@@ -543,6 +573,7 @@ static bool stash_pending(const InventoryMsg& m) {
     g.pend_food  = m.food;
     g.pend_boxes = m.boxes;
     g.pend_hash  = m.hash;
+    g.pend_seq   = m.seq;
     g.pend_have  = true;
     return true;
 }
@@ -575,29 +606,119 @@ static void apply_now(const InventoryMsg& m, const char* when) {
     if (!scalars)
         log_line("INVSYNC", "!! could not write the inventory scalars");
 
+    // F5 ECHO-LOOP FIX, found live 2026-09-05: this peer's own dedupe cache
+    // (last_hash/has_last, used by invsync_publish to skip an unchanged send)
+    // used to update ONLY on the send side. So the instant this peer applied
+    // an incoming push, its OWN state changed under it without its OWN
+    // "what have I already told the other side" cache changing to match --
+    // the very next poll (mgmp_invlock's FrameBegin tick, ~300ms later) saw
+    // bytes that differed from a STALE last_hash and re-sent the exact state
+    // it had just received, with a new seq. The other peer accepted that as
+    // newer (it was, by seq) and re-applied it, repeating the cycle. Measured
+    // live: seq climbing into the 20s within seconds and the bucket sizes
+    // visibly oscillating between two values the whole time the screen was
+    // open, on BOTH peers. Setting the cache here, to what was just applied,
+    // is what makes "nothing has changed since the other side's last word"
+    // true again immediately after applying it.
+    g.last_hash = m.hash;
+    g.has_last  = true;
+
+    // F6: refresh the persistent "last good" copy -- see the State comment.
+    // Only on a COMPLETE, successful apply; a partial one is exactly the
+    // "untrustworthy" case above and must not become the thing we'd revert
+    // BACK to later.
+    if (done == kInvBuckets && scalars) {
+        // Copy BEFORE freeing the old buffer -- invsync_reapply_last_good
+        // feeds `m.data[i]` straight from `g.good_data[i]` itself, so
+        // freeing first would leave m.data[i] dangling before it's read.
+        for (uint32_t i = 0; i < kInvBuckets; ++i) {
+            uint8_t* fresh = nullptr;
+            uint32_t fresh_size = 0;
+            if (m.size[i] && m.data[i]) {
+                fresh = (uint8_t*)malloc(m.size[i]);
+                if (fresh) { memcpy(fresh, m.data[i], m.size[i]); fresh_size = m.size[i]; }
+            }
+            free(g.good_data[i]);
+            g.good_data[i] = fresh;
+            g.good_size[i] = fresh_size;
+        }
+        g.good_coins = m.coins;
+        g.good_food  = m.food;
+        g.good_boxes = m.boxes;
+        g.good_hash  = m.hash;
+        g.good_seq   = m.seq;
+        g.good_have  = true;
+    }
+
     ++g.applied;
-    log_line("INVSYNC", "<- inventory %016llx: %u/%u buckets applied, "
+    log_line("INVSYNC", "<- inventory %016llx seq=%u: %u/%u buckets applied, "
                         "%d coins %d food %d boxes (%s)%s",
-             (unsigned long long)m.hash, done, kInvBuckets,
+             (unsigned long long)m.hash, m.seq, done, kInvBuckets,
              m.coins, m.food, m.boxes, when,
              (done == kInvBuckets && scalars) ? "" : "  -- INCOMPLETE");
 }
 
 // Deferral is only correct while something is guaranteed to call
-// invsync_apply_pending. That something is the client's map-follow tick, so a
-// peer with net_follow off applies where the message arrives, as before -- it is
-// driving its own map anyway, and nothing else would ever drain the queue.
-static bool defer_applies() { return g.is_client && config().net_follow; }
+// invsync_apply_pending. For the client that is the map-follow tick, gated on
+// net_follow -- with it off nothing would ever drain the queue, so applying
+// immediately is the only option left. For the HOST that guarantee is now its
+// own EnterNode hook (mgmp_follow.cpp's host branch calls
+// invsync_apply_pending too) -- unconditional, because the host always drives
+// its own node entries.
+static bool defer_applies() { return g.is_client ? config().net_follow : true; }
 
 void invsync_on_message(const InventoryMsg& m) {
     ensure_state();
     if (!g.on) return;
-    if (!g.is_client) {
-        log_line("INVSYNC", "!! received an inventory from the peer while "
-                            "hosting -- ignored (both peers configured as host?)");
+
+    // F5 accept rule: the Lamport clock over the shared bag. Strictly newer
+    // always wins. A TIE means both peers published from the same prior seq
+    // without having seen each other yet -- the rare true-collision case --
+    // and goes to the host: we are looking at an incoming message, so if WE
+    // are the client the sender can only be the host (direct two-peer link),
+    // and the host's version should win the tie; if we are the host, the
+    // sender was the client, and the host's OWN already-applied version wins,
+    // so the incoming one is rejected. Updated on acceptance, not on
+    // application, because the inventory screen (the only way to make a new
+    // local edit) is unreachable while a push is held for a battle to end, so
+    // there is nothing for a later stash to race against in between.
+    if (!(m.seq > g.seq || (m.seq == g.seq && g.is_client))) {
+        log_line("INVSYNC", "!! inventory seq=%u <= our seq=%u -- stale, dropped",
+                 m.seq, g.seq);
         return;
     }
+    g.seq = m.seq;
 
+    // F5 BUG, found live 2026-09-05: this used to defer unconditionally for
+    // any client with net_follow on, no battle check at all -- correct under
+    // the OLD host-only, per-node-only design, where a push only ever
+    // happened AT node entry, so "apply just before the next node" was
+    // already almost simultaneous with arrival. Now that mgmp_invlock polls
+    // while the inventory screen is open mid-node, that same blanket
+    // deferral held every push hostage until the NEXT node crossing --
+    // which is not "immediate" at all if the players just stand on the map
+    // browsing inventory. The inventory screen can only be open OUTSIDE a
+    // battle in the first place, so gating on lockstep_in_battle() the same
+    // way mgmp_catsync already does costs nothing and fixes it: apply right
+    // away except in the one case (still mid-battle) deferral exists for.
+    // NOT WHILE THE MAP ISN'T TICKING, either -- found live 2026-09-05, and NOT
+    // a return to the blanket deferral the comment above describes reverting.
+    // That old bug held a push until the NEXT NODE regardless of whether a
+    // screen was actually open. This holds only for as long as
+    // MapScreen::update genuinely is not ticking (confirmed: it does not run
+    // under a modal screen like the inventory at all), and follow_map_update
+    // now drains any hold on EVERY tick rather than only at node entry -- so
+    // this lands the instant the screen closes, not at the next node. What it
+    // buys: applying straight into the Inventory object while the screen
+    // showing it is actually open produced a visible "everything just
+    // vanished" flash on the peer watching it -- the state is correct again
+    // moments later, but a person saw the transition happen.
+    if (g.is_client && config().net_follow && !follow_on_map()) {
+        if (stash_pending(m)) { ++g.deferred; return; }
+        // Could not hold -- fall through and apply now rather than drop it.
+    }
+
+    if (!lockstep_in_battle()) { apply_now(m, "on arrival"); return; }
     if (!defer_applies()) { apply_now(m, "on arrival"); return; }
 
     if (!stash_pending(m)) {
@@ -622,12 +743,44 @@ void invsync_apply_pending(const char* why) {
     m.food  = g.pend_food;
     m.boxes = g.pend_boxes;
     m.hash  = g.pend_hash;
+    m.seq   = g.pend_seq;
     for (uint32_t i = 0; i < kInvBuckets; ++i) {
         m.size[i] = g.pend_size[i];
         m.data[i] = g.pend_data[i];
     }
     apply_now(m, why);
     free_pending();   // frees the same buffers m borrowed; m is dead here
+}
+
+// F6, 2026-09-06 -- see mgmp_invlock.h/State's `good_*` comment above.
+// Deferring this behind `follow_on_map()` (queuing through the same
+// `pend_*` path a real incoming push uses) was tried and made the visible
+// glitch WORSE, live-confirmed: the longer the wrong state stays live while
+// the screen is open, the bigger and more jarring the eventual catch-up
+// looked once it finally landed (items going invisible, a correction
+// animating in reverse on some later, unrelated interaction). Reverted to
+// calling apply_now() immediately and unconditionally -- accepted by the
+// user as "works, cosmetically rough, not serious" over every deferred
+// variant tried. Known risk, stated plainly, not yet hit in practice: this
+// runs while the client's OWN inventory screen may be open, which this
+// header's own note above (and mgmp_invsync.h's) names as the one hazard in
+// this module that is a crash rather than a divergence -- a screen holding a
+// pointer into a bag node the reader just freed.
+void invsync_reapply_last_good(const char* why) {
+    ensure_state();
+    if (!g.on || !g.good_have) return;
+
+    InventoryMsg m{};
+    m.coins = g.good_coins;
+    m.food  = g.good_food;
+    m.boxes = g.good_boxes;
+    m.hash  = g.good_hash;
+    m.seq   = g.good_seq;
+    for (uint32_t i = 0; i < kInvBuckets; ++i) {
+        m.size[i] = g.good_size[i];
+        m.data[i] = g.good_data[i];
+    }
+    apply_now(m, why);   // re-populates good_* from itself -- a harmless no-op copy
 }
 
 } // namespace mgmp

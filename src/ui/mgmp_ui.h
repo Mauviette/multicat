@@ -69,4 +69,29 @@ void ui_on_swap(void* window);
 // click that lands on a button must not also land on the board behind it.
 bool ui_captures_input();
 
+// The game's window (wglGetCurrentDC + WindowFromDC, same resolution ui_init
+// uses for its own subclass), as a void* so this header stays free of
+// <windows.h>. Null before the first GL swap. Exposed for anything that needs
+// to post the game a message from outside this file -- e.g. mgmp_leave
+// synthesizing the Escape press it used to have to ask a human for.
+void* ui_game_window();
+
+// Best-effort SetForegroundWindow that also works when this process's OWN
+// thread has not "received the last input event" -- Windows' own foreground-
+// stealing restriction, which a bare SetForegroundWindow call can silently
+// lose to even when called from the target window's own owning process and
+// thread. Attaches this thread's input state to whichever thread currently
+// owns the foreground window first, which is the standard workaround.
+//
+// WHY THIS EXISTS: mgmp_leave's synthesized Escape press was measured to be
+// silently ignored by the game whenever its window was not the true OS
+// foreground window, and a bare SetForegroundWindow() was NOT reliable
+// enough on its own -- confirmed live 2026-09-06, one session where it took
+// one retry, a later session where all 5 retries failed outright with no
+// change in the surrounding code, i.e. exactly the shape of a focus-stealing
+// race rather than a logic bug. Returns whether the window ended up
+// foreground; callers should still proceed either way (posting the message
+// regardless costs nothing and this is best-effort, not a gate).
+bool ui_force_foreground(void* hwnd);
+
 } // namespace mgmp

@@ -53,8 +53,13 @@ struct NetMsg {
     ControlMsg control;
     CursorMsg cursor;
     AimMsg    aim;
+    FaceMsg   face;
     EnterNodeMsg enter_node;
     ChoiceMsg    choice;
+    ScreenVoteMsg screenvote;   // flat, no allocation -- same shape as ControlMsg
+    ShopBuyMsg    shopbuy;      // flat, no allocation -- same shape as ControlMsg
+    LevelUpTargetMsg levelup_target;  // flat, no allocation
+    CursorPingMsg cursorping;   // flat, no allocation
     // The two messages that do not fit the "flat, no allocation" rule above.
     // Their `data` is heap-allocated by the decoder and owned by whoever pops
     // the frame, so EVERY net_poll caller must pass the frame to
@@ -67,6 +72,7 @@ struct NetMsg {
     StateDumpMsg statedump;   // owns its buffer, same contract as catdata
     NodeHashMsg  nodehash;
     HostLeftMsg  hostleft;
+    OwnershipMsg ownership;   // flat, no allocation -- same shape as ControlMsg
     HaltMsg   halt;
     char      refuse[192] = {};
 };
@@ -131,6 +137,19 @@ bool net_send_cursor(const CursorMsg& c);
 // Same contract as net_send_cursor: outside the lockstep contract entirely, so
 // a drop can only make a preview flicker.
 bool net_send_aim(const AimMsg& m);
+// NOT the same contract as CURSOR/AIM: this is a real input (F1.1), sent
+// reliably like ACTION. See FaceMsg in mgmp_proto.h.
+bool net_send_face(const FaceMsg& m);
+// F3.1: a vote toward the screen-exit barrier. Tiny and rare (one per real
+// click on a vote-gated button), same fire-and-forget contract as most of
+// this list.
+bool net_send_screenvote(const ScreenVoteMsg& m);
+// F3.1: mirror a shop/chest purchase to the other peer(s). Same tiny,
+// fire-and-forget contract.
+bool net_send_shopbuy(const ShopBuyMsg& m);
+// F3.1: announce a level-up screen's actual recipient. Same contract.
+bool net_send_levelup_target(const LevelUpTargetMsg& m);
+bool net_send_cursorping(const CursorPingMsg& m);
 // Copies m.data into a temporary frame buffer; the caller keeps ownership of
 // it. This is the only send that can block the game thread for a measurable
 // time -- ~45 KB is more than a default socket send buffer, so it may wait for
@@ -152,6 +171,10 @@ bool net_send_nodehash(const NodeHashMsg& m);
 // dedupe of its own -- mgmp_leave will not send a second one until the host has
 // been back inside a run.
 bool net_send_hostleft(const HostLeftMsg& m);
+
+// F2's ownership table, whole. Host-authored like SAVEFILE/CATDATA/INVENTORY,
+// so it needs no relay entry -- net_send already reaches every connected peer.
+bool net_send_ownership(const OwnershipMsg& m);
 
 // The desync dump. Sent at most once per divergence, so it has no throughput
 // budget to respect and no dedupe to do -- by the time it goes out the run is

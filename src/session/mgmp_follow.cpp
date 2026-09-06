@@ -5,13 +5,19 @@
 #include "mgmp_invsync.h"
 #include "mgmp_nodehash.h"
 #include "mgmp_runhist.h"
+#include "mgmp_ownership.h"
+#include "mgmp_cursor.h"     // F4.1: cursor_on_map_tick
 #include "mgmp_follow.h"
 #include "mgmp_lockstep.h"
+#include "mgmp_leave.h"      // leave_consume_republish_due
+#include "mgmp_savefile.h"   // savefile_republish
 #include "mgmp_net.h"
 #include "mgmp_config.h"
 #include "mgmp_tuning.h"
 #include "mgmp_mem.h"
 #include "mgmp_log.h"
+#include "mgmp_addresses.h"
+#include "mgmp_resolve.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -33,6 +39,17 @@ constexpr uintptr_t kMap_NodeData  = 128;
 // MapNode+0x138: MapNodeType, from MapNode::str_to_type.
 constexpr uintptr_t kNode_Seed = 0x118;
 constexpr uintptr_t kNode_Type = 0x138;
+
+// MapScreen+0xA0: the map marker (see CLAUDE.md's "Where the run is
+// standing" section). +0x50 is where the marker CURRENTLY IS (the walk
+// animation updates this as it moves); +0x60 is what was last SELECTED
+// (glaiel::MapNode::Click's only durable write, confirmed by static
+// disassembly -- see tune::kFollowMarkerWalk's header note). Both are
+// validated against the node vector before being trusted anywhere they are
+// READ; select_node_for_walk below is the one place this module WRITES one.
+constexpr uintptr_t kMap_Marker      = 0xA0;
+constexpr uintptr_t kMarker_AtNode   = 0x50;
+constexpr uintptr_t kMarker_Selected = 0x60;
 
 // MapNode::str_to_type, in enum order. 1 and 18 are three-character names whose
 // string constants IDA did not render; they are not battle types and nothing
@@ -111,6 +128,18 @@ struct State {
     uint32_t suppressed     = 0;
     bool     warned_no_map  = false;
 
+    // See follow_on_button_update: pressing "CloseButton" for the client when
+    // the host has already moved on to a node this peer has not entered.
+    void (*button_click)(void*, bool) = nullptr;
+    uint32_t closed_for_follow = 0;      // how many times this has fired, for shutdown
+
+    // EXPERIMENTAL, F3.2 -- see tune::kFollowMarkerWalk and
+    // select_node_for_walk/marker_at_node. Armed once select_node_for_walk
+    // succeeds for the node currently at the front of pending_q; cleared once
+    // marker_at_node confirms arrival, or after kWalkTimeoutMs.
+    bool     walk_pending    = false;
+    uint64_t walk_started_at = 0;
+
     CRITICAL_SECTION cs;
     bool cs_ready = false;
 };
@@ -182,15 +211,75 @@ uint64_t node_seed0(void* node) {
     return s;
 }
 
+bool read_marker(void* map, const void** out) {
+    if (!map) return false;
+    const void* marker = nullptr;
+    if (!mem_read((const uint8_t*)map + kMap_Marker, &marker, sizeof(marker)) || !marker)
+        return false;
+    *out = marker;
+    return true;
+}
+
+// EXPERIMENTAL, F3.2 -- see tune::kFollowMarkerWalk's header note for the
+// full derivation. Writes the map marker's SELECTED slot directly,
+// replicating the confirmed common-path tail of the REAL
+// glaiel::MapNode::Click (RVA 0x228700, not the RVA once pinned here):
+//
+//     mov rax, [rsi + 0x170]   ; rsi = MapNode*, rax = its MapScreen*
+//     mov rcx, [rax + 0xA0]    ; rcx = the map marker
+//     mov [rcx + 0x60], rsi    ; marker->selected = this node
+//
+// Deliberately does NOT call the real function (its "this" is a UI wrapper
+// whose +8 holds the MapNode*, not the MapNode itself -- calling it with
+// this=node is exactly what crashed the client on 2026-09-05) and does NOT
+// replicate the type==4 ("home") branch, which builds an extra confirmation
+// popup before writing anything. Returns false for that type so the caller
+// falls back to an immediate, unanimated entry -- same as before this existed.
+bool select_node_for_walk(void* map_screen, void* node) {
+    if (!map_screen || !node) return false;
+    if (node_type(node) == 4) return false;   // "home" -- not replicated, see above
+    const void* marker = nullptr;
+    if (!read_marker(map_screen, &marker)) return false;
+    return mem_write((uint8_t*)marker + kMarker_Selected, &node, sizeof(node));
+}
+
+// Has the marker's own walk animation actually reached `node` yet? Same
+// +0x50 slot follow_marker_node (below) resolves to an index for the panel;
+// this compares the raw pointer directly since the caller already holds the
+// live MapNode*, and it is polled every tick rather than trusted once.
+bool marker_at_node(void* map_screen, const void* node) {
+    if (!map_screen || !node) return false;
+    const void* marker = nullptr;
+    if (!read_marker(map_screen, &marker)) return false;
+    const void* at = nullptr;
+    if (!mem_read((const uint8_t*)marker + kMarker_AtNode, &at, sizeof(at))) return false;
+    return at == node;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
+
+void follow_set_base(uintptr_t base) {
+    (void)base;   // no longer needed: select_node_for_walk writes memory
+                  // directly rather than calling into a pinned RVA -- see
+                  // tune::kFollowMarkerWalk's header note.
+    g.button_click = nullptr;
+    const uintptr_t click = addr_of_call(C_ButtonClick);
+    if (!click) {
+        log_line("FOLLOW", "!! %s did not resolve -- this peer's modal screens will not"
+                           " auto-close when the host moves on", kCalls[C_ButtonClick].name);
+    } else {
+        g.button_click = (void(*)(void*, bool))click;
+    }
+}
 
 void follow_init() {
     if (!g.cs_ready) { InitializeCriticalSection(&g.cs); g.cs_ready = true; }
     g.on        = config().net_follow;
     g.is_client = (net_role() == NetRole::Client);
     g.map       = nullptr;
+    g.walk_pending = false;
     pending_clear();
     if (!g.on) { log_line("FOLLOW", "map following disabled by net_follow = 0"); return; }
     log_line_lvl(LogLevel::Trace, "FOLLOW", "armed -- %s",
@@ -210,8 +299,9 @@ void follow_init() {
 void follow_shutdown() {
     if (!g.on) return;
     log_line_lvl(LogLevel::Trace, "FOLLOW",
-             "done: %u published, %u followed, %u local click(s) suppressed",
-             g.published, g.entered, g.suppressed);
+             "done: %u published, %u followed, %u local click(s) suppressed, %u modal"
+             " screen(s) auto-closed", g.published, g.entered, g.suppressed,
+             g.closed_for_follow);
     g.on = false;
     if (g.cs_ready) { DeleteCriticalSection(&g.cs); g.cs_ready = false; }
 }
@@ -296,6 +386,21 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     // same id from the same field of the same node in follow_map_update.
     const uint64_t seed = node_seed0(node);
     lockstep_enter_battle(seed);
+
+    // F5, 2026-09-05: the symmetric half of the client's apply-before-
+    // remember_node below. The client is not the only one who can locally
+    // equip something any more (F6 lets either peer touch their own cats), so
+    // the host needs the same safe landing point for whatever the CLIENT sent
+    // while the host was off doing something else -- mid-battle, most
+    // pointedly, since catsync/invsync's defer_applies() now holds a push for
+    // exactly this moment on the host side too. Same two reasons as the
+    // client: this is off the battle screen, and it is still before this
+    // peer's own publish two lines down, so that publish reflects the merged
+    // state rather than stomping the client's just-applied change straight
+    // back out.
+    invsync_apply_pending("entering a node");
+    catsync_apply_pending("entering a node");
+
     remember_node(index, count, type, seed);
 
     // Cats FIRST, node second. TCP is ordered and the client applies a CATDATA
@@ -314,6 +419,10 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     // one nothing pushed until now. Same ordering requirement as the other two:
     // BEFORE the node, because it is what the next event will be rolled from.
     runhist_publish("entering a node");
+    // F2's ownership table, same ordering requirement: BEFORE the node,
+    // because a battle built from this node is the reason the table needs to
+    // already be there -- see mgmp_ownership.h.
+    ownership_publish("entering a node");
 
     EnterNodeMsg m{};
     m.index      = index;
@@ -382,23 +491,13 @@ uint64_t follow_here_seed() { return g.have_here ? g.here_seed : 0; }
 // and a reloaded run parked on an unresolved node is exactly when you need to
 // be told which node that is.
 //
-// glaiel::MapNode::Click sets the current node with
-//
-//     *(MapNode+0x170 -> MapScreen) + 0xA0) + 0x60 = node
-//
-// and guards its own entry on the same read. MapScreen+0xA0 is the map MARKER
-// (sub_14038DE60 calls MapMarker::CanReachNode on it and derives a facing from
-// it), and it carries two node slots: +0x50, which is where the marker IS, and
-// +0x60, which is what Click selected.
-//
-// BOTH ARE VALIDATED AGAINST THE NODE VECTOR RATHER THAN TRUSTED. index_of_node
-// only reports an index when the pointer is genuinely an element of
-// MapScreen+0x80, so a wrong offset yields "unknown" instead of a confident
-// wrong number -- the same rule the per-turn state hash follows. That is what
-// makes reading two undocumented slots an acceptable risk here.
-constexpr uintptr_t kMap_Marker      = 0xA0;
-constexpr uintptr_t kMarker_AtNode   = 0x50;
-constexpr uintptr_t kMarker_Selected = 0x60;
+// kMap_Marker/kMarker_AtNode/kMarker_Selected are declared near the top of
+// this file, where select_node_for_walk and marker_at_node also use them.
+// BOTH slots below are VALIDATED AGAINST THE NODE VECTOR RATHER THAN TRUSTED:
+// index_of_node only reports an index when the pointer is genuinely an
+// element of MapScreen+0x80, so a wrong offset yields "unknown" instead of a
+// confident wrong number -- the same rule the per-turn state hash follows.
+// That is what makes reading two undocumented slots an acceptable risk here.
 
 bool read_marker_node(uintptr_t slot, uint32_t& index) {
     if (!g.map) return false;
@@ -497,6 +596,40 @@ void* follow_map_update(void* map_screen) {
     // The map is ticking, so the run is BETWEEN nodes. This is the stamp the
     // save flush reads -- see follow_on_map.
     g.map_tick = GetTickCount64();
+
+    // THE MAP SCREEN ITSELF TICKING IS THE SIGNAL mgmp_leave WAITS FOR to
+    // republish the save after this host resumed a run straight from the
+    // house (no fresh save-selection click, so nothing else republishes it).
+    // Deliberately not the earlier "back InRun" reading (class-chooser /
+    // item-setup already reads InRun before the player has validated
+    // anything) and deliberately not the first EnterNode either, once this
+    // existed to try: MapScreen::update only ever ticks once the run has
+    // genuinely been launched onto the map, so it fires as soon as the host
+    // ARRIVES on the map -- before they have clicked into any node -- letting
+    // a waiting client rejoin that much sooner. See
+    // leave_consume_republish_due's comment for the full history. Host-only:
+    // a client's own follow_map_update runs too, and must not republish
+    // anything.
+    if (!g.is_client && leave_consume_republish_due()) savefile_republish();
+    // Sibling case, same tick: a save published while the host was in the
+    // house (ready=0 -- see SaveFileMsg::ready) rather than resuming an
+    // announced departure. Both can call savefile_republish on the same
+    // tick; that is harmless, it only resets a publish latch.
+    savefile_on_host_map_tick();
+
+    // F5, 2026-09-05: drain any cat/inventory push held because a modal
+    // screen (the inventory) was open -- see the new hold branch in
+    // mgmp_catsync.cpp/mgmp_invsync.cpp's on_message. Called on EVERY tick
+    // now, not only at node entry, so a hold clears the instant the screen
+    // closes rather than waiting for the next node. Both are no-ops with
+    // nothing held, which is the common case.
+    invsync_apply_pending("the map resumed ticking");
+    catsync_apply_pending("the map resumed ticking");
+
+    // F4.1, 2026-09-05: the peer cursor's map-screen half -- see
+    // cursor_on_map_tick's own comment for why this is the right (and only
+    // available) place for it.
+    cursor_on_map_tick();
 
     // --- a jump asked for by the debug panel --------------------------------
     //
@@ -611,6 +744,39 @@ void* follow_map_update(void* map_screen) {
                            " entering anyway, the seed matched",
                  p.index, node_type_name(type), node_type_name(p.type));
 
+    // EXPERIMENTAL, F3.2: let the marker visibly WALK to this node before
+    // entering it, instead of teleporting. Node/seed/type are already
+    // confirmed to match the host above, so this only ever delays entry into
+    // a node we were already going to enter -- it never changes WHICH node.
+    if (tune::kFollowMarkerWalk) {
+        if (!g.walk_pending) {
+            if (select_node_for_walk(map_screen, node)) {
+                g.walk_pending    = true;
+                g.walk_started_at = GetTickCount64();
+                log_line("FOLLOW", "selected node %u for the marker to walk to"
+                                   " before entering", p.index);
+                return nullptr;   // wait for a later tick
+            }
+            // select failed (a 'home' node, or a read/write failure) -- fall
+            // through and enter immediately, same as the non-walk path.
+        } else {
+            constexpr uint64_t kWalkTimeoutMs = 5000;   // safety net, not a real design constraint
+            const uint64_t waited = GetTickCount64() - g.walk_started_at;
+            if (marker_at_node(map_screen, node)) {
+                log_line("FOLLOW", "marker arrived after %llu ms -- entering",
+                         (unsigned long long)waited);
+                g.walk_pending = false;
+            } else if (waited > kWalkTimeoutMs) {
+                log_line("FOLLOW", "!! marker did not arrive within %llu ms --"
+                                   " entering anyway (this node will teleport)",
+                         (unsigned long long)kWalkTimeoutMs);
+                g.walk_pending = false;
+            } else {
+                return nullptr;   // still walking
+            }
+        }
+    }
+
     const uint32_t entering = p.index;
     pending_pop();
     ++g.entered;
@@ -646,6 +812,7 @@ void* follow_map_update(void* map_screen) {
     invsync_apply_pending("about to follow the host into a node");
     catsync_apply_pending("about to follow the host into a node");
     runhist_apply_pending("about to follow the host into a node");
+    ownership_apply_pending("about to follow the host into a node");
 
     remember_node(entering, count, type, seed);
 
@@ -658,7 +825,69 @@ void* follow_map_update(void* map_screen) {
         log_line("FOLLOW", "!! LEFT SHIFT is down -- EnterNode branches on it and"
                            " this peer will not take the host's path");
 
+    // The F3.2 marker walk (tune::kFollowMarkerWalk) already ran above, before
+    // `entering` was even assigned -- by the time execution reaches here the
+    // marker has either visibly arrived at `node` or the feature is off/not
+    // applicable, so there is nothing left to do but enter.
     return node;
+}
+
+// Cahier des charges: close any screen the client is looking at when the
+// host has already moved on, so the client is never caught browsing its
+// inventory on the map while the host is mid-battle -- the user's own
+// example of the failure mode this closes.
+//
+// FROM h_ButtonUpdate, NOT from a MapScreen hook, and that is the whole
+// design: MapScreen::update -- and therefore follow_map_update above --
+// DOES NOT TICK while a modal screen like the inventory is open (confirmed
+// live in an earlier session, see mgmp_invsync.h's F5 history). So the
+// client cannot even LEARN it has a node to follow until whatever screen it
+// has open closes on its own. Button::update, by contrast, fires for every
+// button regardless of screen state -- the same property cursor_on_map_tick
+// and the (reverted) auto-reopen experiment both relied on.
+//
+// CLOSE ONLY, NEVER REOPEN. A prior session tried closing AND reopening the
+// inventory automatically; the close half worked every time, the reopen
+// click had no confirmed effect and once left the screen stuck shut with no
+// way back -- worse than the accepted "stale until you close it yourself"
+// limitation it was trying to remove. See mgmp_hooks.cpp's h_ButtonUpdate
+// for where that attempt is preserved in a comment. This only ever presses
+// a button already proven to work, and it only presses it when there is
+// somewhere for the player to end up (the map, about to follow a queued
+// node) -- never leaves them stranded.
+//
+// NAME-ONLY, NOT SCREEN-SPECIFIC. kBtnName_Close ("CloseButton") was only
+// ever confirmed on the inventory screen, but it reads as a generic
+// component name rather than an inventory-specific one, so this does not
+// special-case that screen -- it presses ANY button by that exact name,
+// gated purely on "a follow is due". If another modal screen shares the
+// name, this closes it too, for free; if it uses a different name, this
+// simply does nothing there yet.
+void follow_on_button_update(void* button) {
+    if (!g.on || !g.is_client || !button || !g.button_click) return;
+    if (!pending_any()) return;   // nothing queued -- nothing to close for
+
+    char name[64];
+    if (!mem_read_std_string((const uint8_t*)button + kBtn_Name, name, sizeof(name))) return;
+    if (strcmp(name, kBtnName_Close) != 0) return;
+
+    ++g.closed_for_follow;
+    log_line("FOLLOW", "the host has moved on and this peer is looking at a modal"
+                       " screen ('%s' is up) -- closing it so the map can follow",
+             name);
+    g.button_click(button, false);
+}
+
+bool follow_on_button_click(void* self) {
+    if (!g.on || !g.is_client || !self) return false;
+
+    char name[64];
+    if (!mem_read_std_string((const uint8_t*)self + kBtn_Name, name, sizeof(name))) return false;
+    if (strcmp(name, kBtnName_MapNode) != 0) return false;
+
+    log_line("FOLLOW", "swallowed a client click on a map node -- the host owns node"
+                       " selection, this peer only follows");
+    return true;
 }
 
 } // namespace mgmp

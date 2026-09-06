@@ -14,8 +14,11 @@
 #include "mgmp_aim.h"
 #include "mgmp_nodehash.h"
 #include "mgmp_runhist.h"
+#include "mgmp_ownership.h"
 #include "mgmp_follow.h"
 #include "mgmp_choice.h"
+#include "mgmp_screensync.h"
+#include "mgmp_shopmirror.h"
 #include "mgmp_savefile.h"
 #include "mgmp_leave.h"
 #include "mgmp_session.h"
@@ -24,7 +27,7 @@
 #include "mgmp_config.h"
 #include "mgmp_tuning.h"
 #include "mgmp_mem.h"
-#include "mgmp_split.h"
+#include "mgmp_ownertable.h"
 #include "mgmp_rtti.h"
 #include "mgmp_rng.h"
 #include "mgmp_log.h"
@@ -35,6 +38,16 @@
 #include <cstdarg>
 
 namespace mgmp {
+
+// F1.1: forward-declared here, before the anonymous namespace, because its
+// definition (further down, with the rest of the F1.1 code) has external
+// linkage, and snapshot_cats() below -- inside the anonymous namespace --
+// must call it to clear stale per-battle state. A forward declaration placed
+// inside the anonymous namespace instead creates an unlinkable
+// internal-linkage twin of the real definition; see the F2 fix that hit this
+// exact trap with face_track_reset.
+void face_broadcast_reset();
+
 namespace {
 
 // This counts ENTRIES IN THE BATTLE'S CHARACTER LIST, which is mostly scenery.
@@ -228,6 +241,23 @@ struct State {
     // resolves a Brain back to a roster index. False during an enemy or AI
     // turn, which is correct: that turn belongs to nobody, so no cursor lights.
     bool     local_actor = false;
+
+    // F1.1: the roster index of whoever fill_choice last resolved a brain for
+    // -- i.e. the current actor, updated every frame of that actor's turn.
+    // kNoCat between battles or when the last poll was a summon's. Used to
+    // EXCLUDE the acting cat from the continuous facing broadcast: see the
+    // long note above lockstep_on_action_applied for why polling a cat whose
+    // CombatAnimation may be in flight is unsafe, and why the acting cat's own
+    // facing is instead covered by the action-boundary push alone.
+    uint8_t  current_actor_cat = kNoCat;
+
+    // F4: the resolved owner of each roster slot, mirroring local_cat[] but
+    // carrying WHICH peer rather than just "ours or not" -- kNoOwner for an
+    // AI/summon slot or a human slot whose ownership has not been decided
+    // yet. Populated in the same split loop that sets local_cat[], read by
+    // lockstep_owner_of_character for the turn-owner badge (mgmp_turnbadge).
+    // Reset to kNoOwner (never 0, which is a real peer id) at every snapshot.
+    uint8_t  cat_owner[kMaxCats] = {};
 
     // The two directions a counterpart can arrive from; see mgmp_hashring.h.
     //
@@ -734,6 +764,14 @@ void snapshot_cats(void* turn_control) {
     g.hashed_count = 0;
     g.dump_sent    = false;
     g.dump_seen    = false;
+    g.current_actor_cat = kNoCat;
+    for (uint32_t i = 0; i < kMaxCats; ++i) g.cat_owner[i] = kNoOwner;
+
+    // F1.1: the continuous facing broadcast's per-cat cache is keyed by
+    // roster SLOT INDEX, which a new battle reassigns to entirely different
+    // Character pointers -- without this, turn 1 of a new fight compares
+    // against a stale value left by a different cat in a previous battle.
+    face_broadcast_reset();
 
     // --- who is human -------------------------------------------------
     //
@@ -758,48 +796,55 @@ void snapshot_cats(void* turn_control) {
     for (uint32_t i = 0; i < kMaxCats; ++i) g.local_cat[i] = false;
 
     if (cfg.net_control_auto) {
-        // Derived identically on both peers rather than negotiated, which is
-        // why it needs no message and no waiting: the roster is byte-identical
-        // (measured -- 29 cats, same brain class per index, two processes with
-        // completely different heap addresses), the human filter is the same
-        // string compare, and the rule below is pure arithmetic. Both peers
-        // still exchange CONTROL afterwards, but as a check on the result --
-        // not as the source of it.
+        // F2 (cahier-des-charges-mgmp-fork.md): ownership is decided ONCE, at
+        // the meta layer, and never recomputed from a battle's roster shape.
+        // This used to be split_for(g.humans, peers, pos) -- fair division
+        // over THIS BATTLE'S human count, recomputed fresh every fight -- and
+        // that is exactly the bug F2 exists to remove: a party member dying
+        // or a new recruit changes `humans`, and split_for would reshuffle
+        // every cat in the run the next time anyone fought. mgmp_split.h still
+        // has that formula (mgmp_ownertable's initial_split is the same
+        // fair-division arithmetic, applied once to the persistent position
+        // space instead) but nothing calls split_for from here any more.
         //
-        // Spread the human cats over however many players are in the session,
-        // in roster order, host first, with the remainder going to the earliest
-        // positions. Four cats over three players is 2/1/1; three over two is
-        // 2/1, which is what the two-player rule always did -- the old
-        // `(humans+1)/2` is exactly this formula at P=2, so nothing changes for
-        // a two-player session.
-        //
-        // Position, not peer id: see net_peer_pos. And contiguous rather than
-        // interleaved, so each player's cats are adjacent in the roster and the
-        // log is readable by eye.
-        uint32_t P   = net_peer_count();
-        uint32_t pos = net_peer_pos();
-        if (P == 0) {
-            // No PEERS yet. Claim nothing rather than guess: claiming
-            // everything would have two peers driving the same cat, and
-            // claiming half assumes a player count we have not been told.
-            P = 1; pos = 0;
-            log_line("LOCKSTEP", "!! no peer list yet -- deferring the split; if "
-                                 "this repeats, PEERS never arrived");
-        }
-        const SplitRange range = split_for(g.humans, P, pos);
-        const uint32_t   mine  = range.count;
-
-        uint32_t seen = 0;
+        // Position is still the key, for the reason it always was -- no
+        // Character->CatData link exists to resolve a roster slot back to a
+        // persistent identity (a live memory scan ruled that out, 2026-09-04:
+        // see mgmp_ownertable.h) -- but the battle roster's human-brained cats
+        // appear in the same relative order every fight for a fixed team. So
+        // "the Nth human-brained cat encountered here" is looked up in the
+        // SAME table both peers already hold (mgmp_ownership), rather than
+        // recomputed from this battle's humans/peers counts.
+        const uint8_t self = net_self();
+        uint32_t seen = 0, unresolved = 0;
         for (uint32_t i = 0; i < g.cat_count; ++i) {
             if (!g.human_cat[i]) continue;
-            g.local_cat[i] = split_owns(range, seen);
+            const uint8_t owner = ownership_owner_of(seen);
+            g.cat_owner[i] = owner;   // kNoOwner too -- see the badge's fail-open note
+            if (owner == kNoOwner) {
+                // NOT GUESSED AT. Left unclaimed by BOTH peers -- a loud stall
+                // on this cat's turn is safer than a guess the real table
+                // might contradict once it catches up, which would be the
+                // exact mid-run reshuffle F2 forbids.
+                g.local_cat[i] = false;
+                ++unresolved;
+            } else {
+                g.local_cat[i] = (owner == self);
+            }
             ++seen;
         }
 
-        if (mine == 0 && g.humans)
-            log_line("LOCKSTEP", "!! %u human cat(s) over %u player(s) leaves this "
-                                 "peer (position %u) with none -- it will watch "
-                                 "this battle", g.humans, P, pos);
+        uint32_t mine = 0;
+        for (uint32_t i = 0; i < g.cat_count; ++i) if (g.local_cat[i]) ++mine;
+
+        if (unresolved)
+            log_line("LOCKSTEP", "!! %u of %u human cat(s) have no ownership "
+                                 "decided yet -- unclaimed by BOTH peers, their "
+                                 "turns will stall until OWNERSHIP catches up",
+                     unresolved, g.humans);
+        if (mine == 0 && g.humans && !unresolved)
+            log_line("LOCKSTEP", "!! this peer owns none of the %u human cat(s) "
+                                 "in this battle -- it will watch", g.humans);
     } else {
         for (uint32_t i = 0; i < cfg.net_control_count; ++i) {
             uint8_t idx = cfg.net_control[i];
@@ -807,6 +852,15 @@ void snapshot_cats(void* turn_control) {
             else log_line("LOCKSTEP", "!! net_control names cat %u but the battle has %u",
                           (unsigned)idx, g.cat_count);
         }
+        // An explicit net_control list has no ownership TABLE behind it, only
+        // "ours"/"not ours" -- so the badge's owner id is a two-peer guess
+        // (the one peer this is not) rather than a real resolved value. This
+        // path is a debug/test override, not the normal auto-split; accepted
+        // for that reason.
+        const uint8_t self  = net_self();
+        const uint8_t other = (self == 0) ? 1 : 0;
+        for (uint32_t i = 0; i < g.cat_count; ++i)
+            if (g.human_cat[i]) g.cat_owner[i] = g.local_cat[i] ? self : other;
     }
 
     uint32_t local = 0;
@@ -1898,6 +1952,293 @@ void lockstep_preview_facing_end() {
 
 uint32_t lockstep_preview_facing_count() { return g_pf.restored; }
 
+// --- F1.1: a cat's facing, pushed as ground truth --------------------------
+//
+// Three mechanisms, not one, each closing a gap the others cannot:
+//
+// 1. lockstep_on_action_applied, below: an IMMEDIATE push at every action
+//    boundary (type 2 or 3) for a cat this peer owns. Fires the instant that
+//    cat's own turn ends, and reads the field before that action's own
+//    DOACTION/animation has even started, so it is always a safe read.
+//
+// 2. lockstep_face_frame_tick, further down: a continuous per-frame push of
+//    every owned human cat's facing EXCEPT the current actor's. Closes the
+//    gap (1) cannot: a cat rotated by a free click and left alone, then
+//    attacked from an INDEPENDENTLY-timed decision on another peer. "Waiting
+//    is free" cuts both ways -- an action that does not wait for an
+//    opponent's input also does not wait for an opponent's state update, so
+//    nothing bounds how soon after a free click an attack reading that cat's
+//    facing can run on the OTHER peer's own timeline. Only a continuous poll
+//    has a chance of winning that race.
+//
+// 3. lockstep_face_turn_tick, further down still: the same push for EVERY
+//    owned cat (including the one (2) just excluded), once per turn
+//    boundary. A slower, coarser safety net behind (2), and the reason (2)
+//    is safe to skip the acting cat: this catches it once its animation has
+//    settled, which a per-frame poll of the SAME cat cannot do safely (next
+//    paragraph).
+//
+// The acting cat is excluded from (2) because a first attempt polled every
+// owned cat unconditionally every frame and made things worse, not better:
+// reported live as "rotation syncs fine before either player's first action,
+// then stops updating once anyone attacks, uses an ability, moves." The
+// reason is the same one CLAUDE.md already uses to explain why facing cannot
+// go in the state hash -- CombatAnimation::update ALSO calls Character::Face,
+// mid-animation, and "the animation is in flight at different points on two
+// machines". A cat mid-attack-swing or mid-walk has this field changing
+// continuously and independently on both peers for the animation's whole
+// duration, which can span many frames past the action's own APPLY. Polling
+// THAT cat every frame reads the in-flight noise and rebroadcasts it,
+// fighting the other peer's own local animation writes for control of the
+// field for as long as the animation plays. Idle cats have no such animation,
+// so (2) is safe for them and unsafe for the one cat currently acting -- which
+// is exactly what g.current_actor_cat (set every frame by lockstep_fill_choice)
+// exists to identify.
+//
+// Measured live what (2) closes that (1) and (3) alone did not: a session
+// running only (1) and a turn-boundary version of (3) still HALTed -- the
+// turn-boundary re-send fired correctly at turn 3's start, but the peer
+// attacking cat 37 had already decided that attack independently, against a
+// facing not updated since turn 2 (STATE DIFF: cat 37 hp 16|18 FACE
+// (1,0)|(0,1)). A turn boundary is a checkpoint on the OWNING peer's own
+// timeline; it gives no guarantee about when an unrelated peer's own
+// locally-decided action runs.
+//
+// Earlier attempts at continuous coverage also tried to POLICE the field
+// instead of just broadcasting it -- an "enforce" branch on the RECEIVING
+// side that reverted a mismatch it decided was illegitimate. Every version of
+// that broke on the same wall: a real action for a cat this peer does NOT own
+// is still simulated locally (that is the whole lockstep model), and it
+// changes that cat's facing through the exact same field a rogue click would
+// have -- there is no way to tell the two apart after the fact by looking at
+// the field alone. So the receiver here does no policing at all (see
+// lockstep_on_face_message): it just applies whatever the owner last said.
+void lockstep_on_action_applied(const void* actor) {
+    if (!actor) return;
+    const uint8_t i = cat_index_of(actor);
+    if (i == kNoCat)     return;   // a summon: in nobody's roster
+    if (!g.human_cat[i]) return;   // an AI cat: both peers derive it locally
+    if (!g.local_cat[i]) return;   // not ours -- we RECEIVE its facing, never publish it
+
+    const uint8_t* ch = (const uint8_t*)actor;
+    int32_t fx = 0, fy = 0;
+    if (!mem_read(ch + kChar_Facing,     &fx, sizeof(fx))) return;
+    if (!mem_read(ch + kChar_Facing + 4, &fy, sizeof(fy))) return;
+
+    FaceMsg m;
+    m.battle_id = g.battles.current;
+    m.cat       = i;
+    m.fx = fx; m.fy = fy;
+    if (net_send_face(m))
+        log_line("LOCKSTEP", "FACE cat %u is now (%d,%d) -- sent", i, fx, fy);
+}
+
+// The REAL Character::Face, called instead of a raw memory write.
+//
+// THIS DOES NOT CLOSE THE F1.1 ROTATION-DESYNC BUG -- recorded here so the
+// distinction is not lost. A hardware watchpoint (armed live, 2026-09-05, on
+// the current thread only) caught a real, previously-unknown instruction
+// writing a peer-owned cat's facing almost every frame, from code that is
+// NOT this function, and NOT gated by whether this function is used to apply
+// an incoming FACE message: calling the real Character::Face here (instead
+// of the raw mem_write this replaced) was tried on the theory that it might
+// update a second cached copy the unknown instruction reads from -- measured
+// live, it does not; the exact same HALT reproduced with the identical
+// hashes either way. The unknown instruction was traced to a `mov
+// [rdi+388h], rbx` inside a repeating bounds-checked-vector-access pattern
+// (three near-identical check+call blocks in a row), but rbx -- the value it
+// writes -- is never set anywhere in the ~230 bytes around it; it arrives
+// already loaded, meaning it is a parameter from a caller this project has
+// not traced. Closing this needs IDA on the current build, not another
+// blind hex dump. See the F1.1 memory entry for the full investigation.
+//
+// Kept anyway because it is a strict improvement over the raw write it
+// replaced: whatever real bookkeeping a genuine click's call to
+// Character::Face performs, this now does too, even though it is not what
+// closes the race above. Resolved dynamically rather than by a new
+// signature: the exact call site is already documented in
+// mgmp_addresses.h's PREVIEWFACE entry (RVA 0x1377C9, offset 0x2F9 from
+// Brain::UpdateDecision's own RVA 0x1374D0). Reading that instruction's own
+// bytes and decoding its rel32 is self-verifying -- refuses unless the byte
+// is really 0xE8 (call rel32).
+typedef void (__fastcall* fn_char_face)(void* self, int64_t dir_packed);
+fn_char_face g_real_face       = nullptr;
+bool         g_real_face_tried = false;
+
+fn_char_face resolve_character_face() {
+    if (g_real_face_tried) return g_real_face;
+    g_real_face_tried = true;
+
+    const uintptr_t ud = addr_of(T_UpdateDecision);
+    if (!ud) {
+        log_line_lvl(LogLevel::Warn, "LOCKSTEP",
+                     "!! Character::Face resolution needs UpdateDecision, which "
+                     "did not resolve -- FACE apply will fall back to a raw write");
+        return nullptr;
+    }
+    const uintptr_t call_site = ud + 0x2F9;
+    uint8_t bytes[5] = {};
+    if (!mem_read((const void*)call_site, bytes, sizeof(bytes)) || bytes[0] != 0xE8) {
+        log_line_lvl(LogLevel::Warn, "LOCKSTEP",
+                     "!! Character::Face resolution refused -- UpdateDecision+0x2F9 "
+                     "is not a call (byte=%02X) -- FACE apply will fall back to a "
+                     "raw write", bytes[0]);
+        return nullptr;
+    }
+    int32_t rel = 0;
+    memcpy(&rel, bytes + 1, 4);
+    g_real_face = (fn_char_face)(call_site + 5 + (intptr_t)rel);
+    log_line("LOCKSTEP", "Character::Face resolved dynamically at %p", (void*)g_real_face);
+    return g_real_face;
+}
+
+void lockstep_on_face_message(const FaceMsg& m) {
+    if (stale_battle(m.battle_id, "a facing change")) return;
+    if (m.cat >= kMaxCats || m.cat >= g.cat_count) return;
+    void* ch = (void*)g.cats[m.cat];
+    if (!ch) return;
+
+    fn_char_face face = resolve_character_face();
+    if (face) {
+        const int64_t packed = (uint32_t)m.fx | ((int64_t)(uint32_t)m.fy << 32);
+        __try {
+            face(ch, packed);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log_line_lvl(LogLevel::Warn, "LOCKSTEP",
+                         "!! Character::Face(cat %u) faulted -- falling back to a "
+                         "raw write for the rest of this session", m.cat);
+            g_real_face = nullptr;
+        }
+    }
+    if (!face) {
+        mem_write((uint8_t*)ch + kChar_Facing,     &m.fx, sizeof(m.fx));
+        mem_write((uint8_t*)ch + kChar_Facing + 4, &m.fy, sizeof(m.fy));
+    }
+
+    // Read back rather than trust either path blindly: a silent revert one
+    // instruction later would look identical to success otherwise.
+    int32_t rx = 0, ry = 0;
+    const bool rx_ok = mem_read((const uint8_t*)ch + kChar_Facing,     &rx, sizeof(rx));
+    const bool ry_ok = mem_read((const uint8_t*)ch + kChar_Facing + 4, &ry, sizeof(ry));
+    const bool stuck = rx_ok && ry_ok && rx == m.fx && ry == m.fy;
+
+    if (stuck)
+        log_line("LOCKSTEP", "FACE cat %u applied (%d,%d)%s", m.cat, m.fx, m.fy,
+                 face ? "" : " (raw write)");
+    else
+        log_line_lvl(LogLevel::Warn, "LOCKSTEP",
+                     "!! FACE cat %u did NOT stick: wanted (%d,%d), read back "
+                     "(%d,%d) ok=%d/%d%s",
+                     m.cat, m.fx, m.fy, rx, ry, rx_ok, ry_ok, face ? "" : " (raw write)");
+}
+
+// The cache serves two callers below: it decides what the turn-boundary tick
+// LOGS (a turn boundary sends unconditionally regardless of change; only the
+// log line's severity depends on whether it actually changed), and it
+// throttles how often the frame tick sends at all (an idle cat that never
+// moves would otherwise get a message every single frame of the battle).
+struct FaceBroadcast {
+    int32_t  fx = 0, fy = 0;
+    bool     have = false;
+    uint64_t last_send_at = 0;
+};
+FaceBroadcast g_facebc[kMaxCats];
+
+// Frequent enough that a free click on an idle cat reaches the other peer
+// well inside realistic human input timing; see the frame-tick's own note for
+// why anything coarser reopens the race it exists to close.
+constexpr uint64_t kFaceMinSendGapMs = 50;
+
+// The frame tick's heartbeat: how often an UNCHANGED idle cat's facing gets
+// re-affirmed anyway. Measured live why this cannot be on-change-only: a cat
+// whose OWNING peer's copy is stable (never changes again after settling)
+// stops being resent the moment it stops changing -- but a NON-owning peer
+// can still corrupt ITS OWN local copy of that same cat at any time (the
+// bidirectional free-click case), and nothing detects that from the sending
+// side, because nothing about the SENDER's value changed. Only a periodic,
+// unconditional resend closes that: cat 37 sent (1,0) once at turn 1 and
+// never again (its value never changed), while the attacking peer's own
+// local copy silently drifted to (0,1) sometime after turn 2 with no
+// incoming FACE to have corrected it -- STATE DIFF: cat 37 hp 16|18 FACE
+// (1,0)|(0,1), same shape as the turn-boundary-only version's failure, one
+// heartbeat interval faster to correct.
+constexpr uint64_t kFaceHeartbeatMs = 200;
+
+void lockstep_face_turn_tick() {
+    if (!g.snapped || g.halted) return;
+
+    for (uint32_t i = 0; i < g.cat_count; ++i) {
+        if (!g.human_cat[i] || !g.local_cat[i]) continue;   // AI, or the peer's cat
+
+        int32_t fx = 0, fy = 0;
+        if (!mem_read((const uint8_t*)g.cats[i] + kChar_Facing,     &fx, sizeof(fx))) continue;
+        if (!mem_read((const uint8_t*)g.cats[i] + kChar_Facing + 4, &fy, sizeof(fy))) continue;
+
+        FaceMsg m;
+        m.battle_id = g.battles.current;
+        m.cat       = (uint8_t)i;
+        m.fx = fx; m.fy = fy;
+        if (!net_send_face(m)) continue;
+
+        FaceBroadcast& fb = g_facebc[i];
+        const bool changed = !fb.have || fb.fx != fx || fb.fy != fy;
+        if (changed)
+            log_line("LOCKSTEP", "FACE cat %u is now (%d,%d) -- sent", i, fx, fy);
+        else
+            log_line_lvl(LogLevel::Trace, "LOCKSTEP", "FACE cat %u re-sent (%d,%d)", i, fx, fy);
+        fb.fx = fx; fb.fy = fy; fb.have = true; fb.last_send_at = GetTickCount64();
+    }
+}
+
+// See the declaration in mgmp_lockstep.h for the full reasoning. Measured
+// live what this closes: the turn-boundary tick alone re-sent cat 37's
+// correct facing at the turn 3 boundary, but the peer attacking cat 37 had
+// already decided that attack, independently, against a facing that had not
+// been updated since turn 2 -- STATE DIFF: cat 37 hp 16|18 FACE (1,0)|(0,1).
+// A turn boundary is a checkpoint on the OWNING peer's own timeline; it gives
+// no guarantee about when an unrelated peer's own locally-decided action
+// runs, because nothing about that decision waits for anything ("waiting is
+// free" cuts both ways -- an action that does not wait for an opponent's
+// input also does not wait for an opponent's state update). Only a
+// continuous poll has any chance of winning that race, so this is the one
+// exception to "read facing only at a settled checkpoint" -- justified by
+// excluding the one cat where an unsettled read is possible.
+void lockstep_face_frame_tick() {
+    if (!lockstep_in_battle()) return;
+    const uint64_t now = GetTickCount64();
+
+    for (uint32_t i = 0; i < g.cat_count; ++i) {
+        if (!g.human_cat[i] || !g.local_cat[i]) continue;   // AI, or the peer's cat
+        if (i == g.current_actor_cat) continue;             // mid-animation risk -- skip
+
+        int32_t fx = 0, fy = 0;
+        if (!mem_read((const uint8_t*)g.cats[i] + kChar_Facing,     &fx, sizeof(fx))) continue;
+        if (!mem_read((const uint8_t*)g.cats[i] + kChar_Facing + 4, &fy, sizeof(fy))) continue;
+
+        FaceBroadcast& fb = g_facebc[i];
+        const bool changed = !fb.have || fb.fx != fx || fb.fy != fy;
+        const uint64_t since = now - fb.last_send_at;
+        if (!((changed && since >= kFaceMinSendGapMs) || since >= kFaceHeartbeatMs))
+            continue;
+
+        FaceMsg m;
+        m.battle_id = g.battles.current;
+        m.cat       = (uint8_t)i;
+        m.fx = fx; m.fy = fy;
+        if (!net_send_face(m)) continue;
+
+        if (changed)
+            log_line("LOCKSTEP", "FACE cat %u is now (%d,%d) -- sent", i, fx, fy);
+        else
+            log_line_lvl(LogLevel::Trace, "LOCKSTEP", "FACE cat %u heartbeat (%d,%d)", i, fx, fy);
+        fb.fx = fx; fb.fy = fy; fb.have = true; fb.last_send_at = now;
+    }
+}
+
+void face_broadcast_reset() {
+    for (uint32_t i = 0; i < kMaxCats; ++i) g_facebc[i] = FaceBroadcast{};
+}
+
 // --- the state fence --------------------------------------------------------
 //
 // See mgmp_lockstep.h. The reason this exists rather than a facing-only guard:
@@ -1917,12 +2258,39 @@ struct StateFence {
 
 StateFence g_sf;
 
+// BUG FOUND LIVE, 2026-09-06: this used to call read_cat_state with no third
+// argument, defaulting to in_battle=true for EVERY cat in the snapshot --
+// including any that had already died or departed the battle by the time
+// this ran. read_cat_state's own header comment names exactly this hazard
+// ("A character the battle has dropped is parked off the board at the
+// (-5000,-5000) sentinel, and get_affecting_elements feeds that raw tile
+// straight into a grid walk with no bounds check"), and dump_cat_states
+// below already computes real membership before calling it for exactly this
+// reason -- this fence just never did the same check. Confirmed as a live
+// crash: repeated caught first-chance AVs inside read_affecting_elements
+// (an "expected" fault per its own __try/__except, but the game does not
+// tolerate this call succeeding OR being retried at a high rate for a
+// genuinely departed cat) immediately preceding a fatal heap-corruption-
+// shaped crash, both inside this fence's call chain
+// (highlight_fenced -> lockstep_state_fence_begin/end -> read_cat_state ->
+// read_affecting_elements), reported live as "the other player's game
+// crashes when I act or pass my turn" -- i.e. whenever THIS peer's own
+// Brain::UpdateDecision hook ran the aim-preview fence while a departed cat
+// was anywhere in the roster.
 void lockstep_state_fence_begin() {
     g_sf.armed = false;
     if (!g.active || !g.snapped || g.halted) return;
     g_sf.count = g.cat_count > kMaxCats ? kMaxCats : g.cat_count;
-    for (uint32_t i = 0; i < g_sf.count; ++i)
-        g_sf.got[i] = read_cat_state(g.cats[i], g_sf.snap[i]);
+
+    uint32_t live = 0, appeared = 0;
+    bool still_in[kMaxCats];
+    const bool have_membership =
+        snapshot_membership(g.snapped_list, live, still_in, appeared);
+
+    for (uint32_t i = 0; i < g_sf.count; ++i) {
+        const bool present = !have_membership || still_in[i];
+        g_sf.got[i] = read_cat_state(g.cats[i], g_sf.snap[i], present);
+    }
     g_sf.armed = true;
 }
 
@@ -1930,11 +2298,21 @@ uint32_t lockstep_state_fence_end(const char* what) {
     if (!g_sf.armed) return 0;
     g_sf.armed = false;
 
+    // Same fix as lockstep_state_fence_begin, and for the same reason: this
+    // re-reads every cat independently and used to default `in_battle` back
+    // to true here too, so a cat correctly marked "departed" going IN could
+    // still crash coming back OUT.
+    uint32_t live = 0, appeared = 0;
+    bool still_in[kMaxCats];
+    const bool have_membership =
+        snapshot_membership(g.snapped_list, live, still_in, appeared);
+
     uint32_t moved = 0;
     for (uint32_t i = 0; i < g_sf.count; ++i) {
         if (!g_sf.got[i]) continue;
+        const bool present = !have_membership || still_in[i];
         CatState now{};
-        if (!read_cat_state(g.cats[i], now)) continue;
+        if (!read_cat_state(g.cats[i], now, present)) continue;
 
         const CatState& was = g_sf.snap[i];
         const bool face_moved = (now.fx != was.fx || now.fy != was.fy);
@@ -2064,6 +2442,12 @@ void lockstep_pump() {
                 runhist_on_message(m.runhist);
                 break;
 
+            // Run state as well: F2's ownership table is true across a battle
+            // boundary (it only ever grows), so a late one is still correct.
+            case MSG_OWNERSHIP:
+                ownership_on_message(m.ownership);
+                break;
+
             // Pure detection, and about a map node rather than a battle -- so
             // it is neither battle-gated nor stale-counted here. It carries its
             // own node seed and mgmp_nodehash matches on that.
@@ -2086,6 +2470,36 @@ void lockstep_pump() {
             // draw, for the same reason the overlay does.
             case MSG_AIM:
                 aim_on_message(m.aim);
+                break;
+
+            // F3.1: about a map-node screen, not a battle -- neither epoch-
+            // gated nor stale-counted here, same class as CHOICE just above.
+            case MSG_SCREENVOTE:
+                screensync_on_message(m.from, m.screenvote);
+                break;
+
+            // F3.1: also about a map-node screen, not a battle.
+            case MSG_SHOPBUY:
+                shopmirror_on_message(m.from, m.shopbuy);
+                break;
+
+            // F3.1: the level-up recipient correction -- independent of
+            // ShopBuyMsg's own timing, see LevelUpTargetMsg's header note.
+            case MSG_LEVELUPTARGET:
+                shopmirror_on_levelup_target(m.from, m.levelup_target);
+                break;
+
+            // F4.2: "look here" -- cosmetic, same class as CURSOR/AIM just
+            // above, so neither epoch-gated nor stale-counted here either.
+            case MSG_CURSORPING:
+                overlay_on_cursorping(m.from, m.cursorping.active);
+                break;
+
+            // NOT cosmetic (F1.1) -- a real input, so it goes through
+            // stale_battle() like everything else that affects simulation
+            // state, rather than the CURSOR/AIM "check at draw time" pattern.
+            case MSG_FACE:
+                lockstep_on_face_message(m.face);
                 break;
 
             case MSG_CONTROL:
@@ -2177,6 +2591,7 @@ bool lockstep_fill_choice(void* brain, void* out) {
     // turn rather than only the ones this function goes on to act upon. A
     // summon (kNoCat) is nobody's, same as an AI cat.
     g.local_actor = (cat != kNoCat) && g.local_cat[cat];
+    g.current_actor_cat = cat;
     if (cat == kNoCat) return false;      // a summon: not in the snapshot, so
                                           // neither peer treats it as owned and
                                           // both let their own AI drive it.
@@ -2403,6 +2818,12 @@ void lockstep_on_applied(const void* action, const void* actor) {
     // cross-check would go once the state hash covers Character fields.
     uint8_t cat = cat_index_of(who);
     if (cat != kNoCat && g.local_cat[cat]) ++g.stats.applied;
+
+    // F1.1: an immediate push of `who`'s settled facing, for whichever peer
+    // owns it -- the function itself is the guard (no-ops for a cat this
+    // peer does not own or that is not human), so calling it unconditionally
+    // here is just calling it once per action rather than branching first.
+    lockstep_on_action_applied(who);
 }
 
 void lockstep_turn_boundary(void* turn_control) {
@@ -2539,6 +2960,10 @@ void lockstep_turn_boundary(void* turn_control) {
     // explain rather than under the next turn's.
     trace_state_deltas();
 
+    // F1.1: same instant, same reasoning -- see the long note above
+    // lockstep_on_action_applied for why this cannot run per-frame instead.
+    lockstep_face_turn_tick();
+
     log_line("LOCKSTEP", "turn %u hash rng=%016llx state=%016llx queue=%u chars=%u/%u%s",
              mine.turn,
              (unsigned long long)mine.rng_hash,
@@ -2575,6 +3000,46 @@ bool lockstep_peer_owns_character(const void* character) {
     if (cat == kNoCat)      return false;   // a summon: nobody's, both AIs drive it
     if (!g.human_cat[cat])  return false;   // an AI cat: decided locally on both
     return !g.local_cat[cat];
+}
+
+// F4: which peer, not just "a peer" -- see lockstep_peer_owns_character above
+// for the boolean version this generalises. kNoOwner covers everything that
+// function returns false for (AI, summon, no session) PLUS the one case it
+// cannot distinguish: a human cat whose owner the table has not decided yet.
+uint8_t lockstep_owner_of_character(const void* character) {
+    if (!g.active || !g.snapped || !character) return kNoOwner;
+    const uint8_t cat = cat_index_of(character);
+    if (cat == kNoCat || !g.human_cat[cat]) return kNoOwner;
+    return g.cat_owner[cat];
+}
+
+// F4: the board tile a live Character* is standing on, for the turn-owner
+// badge -- the same round-trip-validated read read_cat_state uses for the
+// state hash (Character -> TacticsObject -> tile, trusted only if the
+// TacticsObject points back at this exact Character), exposed standalone so
+// a presentation-only caller does not need a CatState to ask one question.
+bool lockstep_character_tile(const void* character, int32_t& x, int32_t& y) {
+    x = y = 0;
+    if (!character) return false;
+    const void* tobj = nullptr;
+    if (!mem_read((const uint8_t*)character + kChar_TObj, &tobj, sizeof(tobj)) || !tobj)
+        return false;
+    const void* back = nullptr;
+    if (!mem_read((const uint8_t*)tobj + kTObj_Owner, &back, sizeof(back)) || back != character)
+        return false;
+    return mem_read((const uint8_t*)tobj + kTObj_Tile,     &x, sizeof(x))
+        && mem_read((const uint8_t*)tobj + kTObj_Tile + 4, &y, sizeof(y));
+}
+
+// F4: the Character* currently being asked for a decision, but ONLY when a
+// human is the one deciding -- an AI/summon turn belongs to no player, so
+// there is nothing for the badge to point at, and nullptr says so rather than
+// making the caller re-check human_cat itself.
+const void* lockstep_current_actor() {
+    if (!g.active || !g.snapped) return nullptr;
+    if (g.current_actor_cat == kNoCat || g.current_actor_cat >= g.cat_count) return nullptr;
+    if (!g.human_cat[g.current_actor_cat]) return nullptr;
+    return g.cats[g.current_actor_cat];
 }
 
 // Called by the map layer from BOTH peers as they enter a node -- the host from

@@ -33,6 +33,7 @@
 #include <string>
 
 #include "json.hpp"
+#include "mgmp_loader_dialog.h"
 
 namespace {
 
@@ -501,8 +502,19 @@ int wmain(int argc, wchar_t** argv) {
     wchar_t game[MAX_PATH] = {};
     int     first_game_arg = 2;
     if (argc >= 2) {
+        // An explicit game path is a deliberate scripted/manual invocation
+        // (tools/net_test.ps1's own shape, or a developer testing something
+        // specific) -- the launcher dialog is for the ordinary double-click
+        // path only, so it is not shown here at all.
         wcsncpy_s(game, argv[1], _TRUNCATE);
-    } else if (!game_from_config(dir, game, MAX_PATH)) {
+    } else {
+        // Reads/writes mgmp.json's net.role/addr/port and shows a small
+        // native dialog to set them, UNLESS launcher.enabled is false or
+        // MGMP_NO_LAUNCHER=1 -- see mgmp_loader_dialog.h. A cancelled dialog
+        // exits here without launching anything.
+        if (!mgmp_loader::run_launcher_dialog(dir)) return 0;
+    }
+    if (game[0] == L'\0' && !game_from_config(dir, game, MAX_PATH)) {
         fwprintf(stderr,
                  L"usage: mgmp_loader.exe <path\\to\\Mewgenics.exe> [args...]\n"
                  L"       mgmp_loader.exe --attach <pid>\n"

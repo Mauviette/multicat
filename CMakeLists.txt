@@ -56,13 +56,20 @@ add_library(mgmp SHARED
     src/session/mgmp_follow.cpp
     src/session/mgmp_savefile.cpp
     src/session/mgmp_leave.cpp
+    src/session/mgmp_cutscene.cpp
     src/session/mgmp_catsync.cpp
     src/session/mgmp_invsync.cpp
     src/session/mgmp_runhist.cpp
+    src/session/mgmp_ownership.cpp
+    src/session/mgmp_invlock.cpp
+    src/session/mgmp_screensync.cpp
+    src/session/mgmp_shopmirror.cpp
     src/session/mgmp_aim.cpp
     src/session/mgmp_nodehash.cpp
     src/session/mgmp_choice.cpp
     src/session/mgmp_combatlock.cpp
+    src/session/mgmp_mainmenulock.cpp
+    src/session/mgmp_turnbadge.cpp
     src/session/mgmp_cursor.cpp
     src/session/mgmp_overlay.cpp
     src/ui/mgmp_ui.cpp
@@ -101,14 +108,17 @@ target_include_directories(mgmp PRIVATE
     # their directory prefix so this one entry covers both.
     third_party/imgui
 )
-target_link_libraries(mgmp PRIVATE minhook kernel32 user32 shell32)
+target_link_libraries(mgmp PRIVATE minhook kernel32 user32 shell32 gdi32)
 
-add_executable(mgmp_loader loader/mgmp_loader.cpp res/mgmp_loader.rc)
+add_executable(mgmp_loader loader/mgmp_loader.cpp loader/mgmp_loader_dialog.cpp
+                           res/mgmp_loader.rc)
 target_compile_definitions(mgmp_loader PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_compile_options(mgmp_loader PRIVATE /W3)
-# third_party for json.hpp: the loader parses mgmp.json for the game path,
-# which is the one setting it needs and the DLL cannot supply.
-target_include_directories(mgmp_loader PRIVATE src/core third_party)
+# third_party for json.hpp: the loader parses mgmp.json for the game path
+# (and now the pre-launch dialog's own role/addr/port), which the DLL cannot
+# supply this early. res for resource.h, the dialog control IDs shared
+# between mgmp_loader_dialog.cpp and res/mgmp_loader.rc.
+target_include_directories(mgmp_loader PRIVATE src/core third_party res)
 target_link_libraries(mgmp_loader PRIVATE kernel32 user32)
 
 # Ship a default config next to mgmp_loader.exe, but never clobber one the user

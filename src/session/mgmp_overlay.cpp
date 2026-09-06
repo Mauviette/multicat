@@ -7,11 +7,17 @@
 #include "mgmp_config.h"
 #include "mgmp_tuning.h"
 #include "mgmp_gpak.h"
+#include "mgmp_choice.h"
+#include "mgmp_invlock.h"      // F6/F4: invlock_current_cat_owner -- the inventory ownership badge
 #include "mgmp_cursor.h"
+#include "mgmp_font_peralta.generated.h"
+#include "mgmp_lockstep.h"
 #include "mgmp_log.h"
 #include "mgmp_mem.h"
 #include "mgmp_net.h"
+#include "mgmp_ownertable.h"   // kNoOwner
 #include "mgmp_proto.h"
+#include "mgmp_screensync.h"   // F3.1 -- the "X/N" screen-exit vote indicator
 #include "mgmp_ui.h"
 
 #include <windows.h>
@@ -249,6 +255,15 @@ struct Art {
     float x0 = 0, y0 = 0, x1 = 128, y1 = 128;
 };
 
+// The "Your turn" banner's texture. Unlike the cursor art, there is no source
+// PNG -- see build_banner_texture -- so this is just the tightly-sized
+// rendered-text bitmap: no ink crop, the whole texture IS the text.
+struct Banner {
+    GLuint tex   = 0;
+    int    tw    = 0, th = 0;
+    bool   tried = false;   // attempted once (success or fail); never retried
+};
+
 const char* kVertexSrc =
     "#version 150\n"
     "in vec2 aPos;\n"            // ALREADY IN NDC -- see below
@@ -321,6 +336,12 @@ struct Peer {
     uint8_t  owns_turn = 0;
     uint64_t at = 0;
     bool     have = false;
+
+    // F4.2: held, not timed -- true for exactly as long as this peer's
+    // cursor.ping_key is physically down (CursorPingMsg.active mirrors the
+    // key state on both edges). draw_cursor's caller checks this every frame
+    // to decide whether to draw this one peer's arrow enlarged/at full alpha.
+    bool ping_active = false;
 };
 
 struct State {
@@ -352,8 +373,30 @@ struct State {
     GLint  u_colour = -1, u_tex = -1, u_usetex = -1;
 
     Art art[kArtCount];
+    // One per distinct string this module draws. Each is built once, lazily,
+    // and kept for the rest of the process -- see build_banner_texture.
+    Banner banner_turn;         // "It's your turn!"
+    Banner banner_your_cat;     // "It's your cat!"
+    Banner banner_partner_cat;  // "Partner's cat!"
+
+    // F3.1: the screen-exit vote indicator, "X/N" -- text changes as votes
+    // come in, unlike the other banners above, so this is a small cache keyed
+    // by the string itself rather than one fixed slot. kMaxPeers+1 possible
+    // counts is all this ever needs (0/N is never shown -- see
+    // screensync_hud_pending, which only returns true once at least one vote
+    // exists).
+    static constexpr int kMaxVoteBanners = 8;
+    Banner vote_banner[kMaxVoteBanners];
+    char   vote_banner_text[kMaxVoteBanners][16] = {};
+    int    vote_banner_count = 0;
 
     Peer peers[kMaxPeers];
+
+    // F4.2: edge detection for cursor.ping_key -- fires a send once per edge
+    // (down AND up), not once per frame the key is held. Also doubles as
+    // "is THIS peer's own ping currently active", for drawing the local
+    // player's own cursor highlighted too.
+    bool ping_key_was_down = false;
 
     float   nx = 0, ny = 0;
     // The window in the MOUSE's own units, asked of SDL every frame. See
@@ -586,6 +629,72 @@ bool build() {
     return true;
 }
 
+// --- the safe upload, shared by the cursor art and the turn banner ---------
+
+// Uploads `w`x`h` RGBA8 pixels into a NEW GL texture, safely -- see load_art's
+// header note for the two ways glTexImage2D fails SILENTLY otherwise: a
+// buffer bound to GL_PIXEL_UNPACK_BUFFER turns `px` into an offset into that
+// buffer instead of a pointer, and stale UNPACK_* pixel-store state shears or
+// shifts the image. Both are neutralised here and restored after, along with
+// the texture binding -- so a caller that wants to verify its own upload
+// (load_art does, for the cursor hotspot) re-binds the returned name itself
+// afterward rather than assuming it is still bound. LINEAR filtering and
+// CLAMP_TO_EDGE wrapping are right for both a cropped cursor glyph and a
+// screen-space banner. Returns 0 (and logs `label`) on a GL error.
+GLuint gl_upload_rgba(const void* px, int w, int h, const char* label) {
+    GLint prev_tex = 0;
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+
+    GLint prev_pbo = 0;
+    gl.GetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &prev_pbo);
+    if (prev_pbo) gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+    struct Store { GLenum e; GLint def; GLint prev; };
+    Store store[] = {
+        { GL_UNPACK_SWAP_BYTES,   0, 0 },
+        { GL_UNPACK_LSB_FIRST,    0, 0 },
+        { GL_UNPACK_ROW_LENGTH,   0, 0 },
+        { GL_UNPACK_SKIP_ROWS,    0, 0 },
+        { GL_UNPACK_SKIP_PIXELS,  0, 0 },
+        { GL_UNPACK_ALIGNMENT,    4, 0 },   // 4 is right for tightly packed RGBA8
+        { GL_UNPACK_SKIP_IMAGES,  0, 0 },
+        { GL_UNPACK_IMAGE_HEIGHT, 0, 0 },
+    };
+    bool store_dirty = false;
+    for (Store& s : store) {
+        gl.GetIntegerv(s.e, &s.prev);
+        if (s.prev != s.def) { gl.PixelStorei(s.e, s.def); store_dirty = true; }
+    }
+
+    gl.GetError();                       // start from a clean slate
+    GLuint tex = 0;
+    gl.GenTextures(1, &tex);
+    gl.BindTexture(GL_TEXTURE_2D, tex);
+    gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    const GLenum uerr = gl.GetError();
+
+    gl.BindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+    if (store_dirty)
+        for (const Store& s : store)
+            if (s.prev != s.def) gl.PixelStorei(s.e, s.prev);
+    if (prev_pbo) gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)prev_pbo);
+
+    if (uerr || tex == 0) {
+        log_line("OVERLAY", "!! %s upload failed -- GL error 0x%04X, texture name %u",
+                 label, (unsigned)uerr, (unsigned)tex);
+        return 0;
+    }
+    if (prev_pbo || store_dirty)
+        trace("%s: the game had left unpack state set (pbo %d, store %s)"
+              " -- neutralised for the upload",
+              label, (int)prev_pbo, store_dirty ? "dirty" : "clean");
+    return tex;
+}
+
 // --- the art ----------------------------------------------------------------
 
 // Loads textures/cursor/<state>.png into a GL texture, once, and measures the
@@ -631,72 +740,28 @@ bool load_art(uint8_t mode) {
     }
     if (x1 < x0 || y1 < y0) { x0 = y0 = 0; x1 = w - 1; y1 = h - 1; }
 
-    GLint prev_tex = 0;
-    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
-
-    // WE ARE UPLOADING INTO SOMEONE ELSE'S GL STATE, AND glTexImage2D DOES NOT
-    // COMPLAIN ABOUT THE TWO WAYS THAT GOES WRONG.
-    //
-    // 1. If a buffer is bound to GL_PIXEL_UNPACK_BUFFER -- which is exactly
-    //    what an engine streaming textures through a PBO leaves bound -- then
-    //    the `px` argument stops being a pointer and becomes an OFFSET into
-    //    that buffer. The upload then succeeds, from the wrong memory, and
-    //    glGetError stays clean. The result is a texture that samples to zero
-    //    alpha: a quad drawn perfectly, containing nothing.
-    // 2. The UNPACK_* pixel-store state is global, and a stale ROW_LENGTH,
-    //    ALIGNMENT or SKIP_* shears or shifts the image with, again, no error.
-    //
-    // Both are invisible from anything else the overlay logs, which is how the
-    // untextured green arrow could draw while the textured cyan one drew
-    // nothing at all. So: unbind the PBO, put every unpack switch back to its
-    // documented default, upload, then hand the state back exactly as found.
-    GLint prev_pbo = 0;
-    gl.GetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &prev_pbo);
-    if (prev_pbo) gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-    struct Store { GLenum e; GLint def; GLint prev; };
-    Store store[] = {
-        { GL_UNPACK_SWAP_BYTES,   0, 0 },
-        { GL_UNPACK_LSB_FIRST,    0, 0 },
-        { GL_UNPACK_ROW_LENGTH,   0, 0 },
-        { GL_UNPACK_SKIP_ROWS,    0, 0 },
-        { GL_UNPACK_SKIP_PIXELS,  0, 0 },
-        { GL_UNPACK_ALIGNMENT,    4, 0 },   // 4 is right for tightly packed RGBA8
-        { GL_UNPACK_SKIP_IMAGES,  0, 0 },
-        { GL_UNPACK_IMAGE_HEIGHT, 0, 0 },
-    };
-    bool store_dirty = false;
-    for (Store& s : store) {
-        gl.GetIntegerv(s.e, &s.prev);
-        if (s.prev != s.def) { gl.PixelStorei(s.e, s.def); store_dirty = true; }
-    }
-
-    gl.GetError();                       // start from a clean slate
-    gl.GenTextures(1, &a.tex);
-    gl.BindTexture(GL_TEXTURE_2D, a.tex);
-    gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    // Clamped, not wrapped: the quad samples the crop box exactly, and a
-    // filtered edge sample that wrapped would pull in the far side of the image.
-    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    const GLenum uerr = gl.GetError();
-
     // The alpha under the hotspot, purely as evidence that the decode produced
-    // pixels rather than a plausible-looking wall of zeroes.
+    // pixels rather than a plausible-looking wall of zeroes. Computed from the
+    // CPU-side buffer before the upload, so it needs no GL state at all.
     const int hx = (int)kArt[mode].hot_x, hy = (int)kArt[mode].hot_y;
     const int probe = (hx >= 0 && hx < w && hy >= 0 && hy < h)
                     ? (int)px[((size_t)hy * w + hx) * 4 + 3] : -1;
 
+    a.tex = gl_upload_rgba(px, w, h, name);
+
     // READ THE TEXTURE BACK, once per state. "The decoded buffer had alpha 255
     // at the hotspot" and "the TEXTURE has alpha 255 at the hotspot" are
     // different claims, and only the second one is about what the sampler will
-    // see -- the whole class of bug above lives in the gap between them. The
-    // GPU round trip is a stall, which is why it happens once per cursor state
-    // at load time and never in the draw path.
+    // see -- the whole class of bug gl_upload_rgba's neutralisation exists for
+    // lives in the gap between them. The GPU round trip is a stall, which is
+    // why it happens once per cursor state at load time and never in the draw
+    // path. Re-binds the texture itself: gl_upload_rgba already restored
+    // whatever was bound before it ran.
     int readback = -1;
-    if (!uerr && a.tex) {
+    if (a.tex) {
+        GLint prev_tex = 0;
+        gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+        gl.BindTexture(GL_TEXTURE_2D, a.tex);
         // The unpack state is neutral but PACK is a different set of switches;
         // a full-image read at alignment 4 with a 4-byte-per-pixel format is
         // immune to every one of them, which is why this reads the whole level
@@ -709,27 +774,13 @@ bool load_art(uint8_t mode) {
                 readback = (int)back[((size_t)hy * w + hx) * 4 + 3];
             free(back);
         }
+        gl.BindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
     }
-
-    gl.BindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
-    if (store_dirty)
-        for (const Store& s : store)
-            if (s.prev != s.def) gl.PixelStorei(s.e, s.prev);
-    if (prev_pbo) gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)prev_pbo);
 
     stbi_image_free(px);
 
-    if (uerr || a.tex == 0) {
-        log_line("OVERLAY", "!! %s upload failed -- GL error 0x%04X, texture name %u",
-                 name, (unsigned)uerr, (unsigned)a.tex);
-        a.tex = 0;
-        return false;
-    }
-    if (prev_pbo || store_dirty) {
-        trace("the game had left unpack state set (pbo %d, store %s)"
-              " -- neutralised for the upload",
-              (int)prev_pbo, store_dirty ? "dirty" : "clean");
-    }
+    if (!a.tex) return false;   // gl_upload_rgba already logged why
+
     // A readback that disagrees with the decode is THE diagnosis, not a hint:
     // the pixels existed and the texture does not have them.
     if (readback != probe) {
@@ -748,6 +799,282 @@ bool load_art(uint8_t mode) {
           kArt[mode].hot_x, kArt[mode].hot_y, probe, readback);
     return true;
 }
+
+// --- the embedded UI font ("Peralta") ----------------------------------------
+//
+// swfs/fonts.swf ships the game's real fonts as 8 DefineFont3 tags -- Flash's
+// OWN vector shape-outline format, not a wrapped TTF/OTF, so there is no
+// shortcut to "just point GDI at the shipped file". But the tags' own name
+// fields (read directly off the SWF, no game code involved) name one of the
+// eight "Peralta" -- a real, freely licensed (SIL OFL) Google Font, not a
+// game-specific asset. Vendored under third_party/fonts/peralta/ and
+// compiled straight into this DLL by tools/embed_font.py, the same
+// no-second-file-to-ship policy as MinHook and stb_image elsewhere in this
+// project. Which of the game's 8 fonts a given piece of UI text actually
+// uses was not otherwise identifiable from here -- this is the one confirmed
+// name that turned out to be a real, legally embeddable font, not a
+// judgement that it is THE UI body font.
+//
+// AddFontMemResourceEx is a PROCESS-PRIVATE registration: no install, no
+// registry entry, and nothing left behind if the process exits uncleanly.
+// Never unregistered on shutdown, same policy as this file's GL objects
+// (mod is injected and never unloaded; the cost of leaking one font
+// registration for the life of the process is far cheaper than a
+// shutdown-from-any-thread bug). Falls back to Segoe UI if registration
+// ever fails, same fail-open policy as every other resource in this file.
+bool ensure_ui_font_loaded() {
+    static bool tried = false;
+    static bool ok    = false;
+    if (tried) return ok;
+    tried = true;
+    DWORD n = 0;
+    HANDLE h = AddFontMemResourceEx((void*)kPeraltaTtf, (DWORD)kPeraltaTtf_size, nullptr, &n);
+    ok = (h != nullptr && n > 0);
+    if (ok) trace("embedded UI font 'Peralta' registered (%u font(s))", (unsigned)n);
+    else    log_line("OVERLAY", "!! AddFontMemResourceEx failed -- text falls back to Segoe UI");
+    return ok;
+}
+
+const char* ui_font_face() { return ensure_ui_font_loaded() ? "Peralta" : "Segoe UI"; }
+
+// --- text banners ("Your turn", "It's your cat!") ---------------------------
+//
+// Text the game never draws for us, so unlike the cursor glyphs this cannot
+// borrow a shipped asset -- each is rendered ONCE with GDI into an off-screen
+// 32bpp bitmap and uploaded through the same gl_upload_rgba path. Built the
+// first time it is needed and kept for the rest of the process: the text
+// never changes, so there is nothing to ever rebuild. `out` is which of
+// State's Banner slots to fill, so one function serves every distinct string
+// this module ever draws.
+//
+// WHITE-ON-BLACK IS THE ALPHA CHANNEL. GDI does not populate a meaningful
+// alpha byte when it draws text -- the DIB's alpha channel is whatever was
+// there before, typically garbage or zero. Drawing white text on a solid
+// black background and then reading LUMINANCE as alpha, with RGB forced back
+// to white, is the standard trick: an anti-aliased edge is a partial-
+// intensity grey, which is exactly the partial coverage alpha is supposed to
+// represent, and a pure black background pixel is correctly alpha 0. This is
+// only correct because the text is drawn pure white on pure black -- anything
+// else drawn into this DIB would need a different conversion. Baking it
+// white (rather than the colour it will actually show as) is deliberate: the
+// draw call TINTS it via the shader's uColour multiply, so one texture per
+// STRING serves any colour a caller wants -- "Your turn" stays white,
+// "It's your cat!" is drawn dark grey without a second render.
+bool build_banner_texture(Banner& out, const char* text) {
+    out.tried = true;
+
+    // Rendered at a fixed pixel size; draw_banner scales the RESULT by the
+    // content rectangle exactly like the cursor's ink height does, so this
+    // only affects rasterisation quality, never the on-screen size.
+    constexpr int kRenderPx = 56;
+
+    HDC measure_dc = GetDC(nullptr);
+    HFONT font = CreateFontA(
+        -kRenderPx, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        ANSI_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, ui_font_face());
+    if (!font) {
+        if (measure_dc) ReleaseDC(nullptr, measure_dc);
+        log_line("OVERLAY", "!! CreateFontA failed -- no turn banner");
+        return false;
+    }
+
+    HGDIOBJ old_font_m = SelectObject(measure_dc, font);
+    SIZE extent = {};
+    GetTextExtentPoint32A(measure_dc, text, (int)strlen(text), &extent);
+    SelectObject(measure_dc, old_font_m);
+    ReleaseDC(nullptr, measure_dc);
+
+    // Padding for AA bleed at the edges, and so the glyph never touches the
+    // texture border where CLAMP_TO_EDGE would otherwise smear it outward.
+    constexpr int kPad = 4;
+    const int tw = extent.cx + kPad * 2;
+    const int th = extent.cy + kPad * 2;
+    if (tw <= 0 || th <= 0 || tw > 2048 || th > 512) {
+        DeleteObject(font);
+        log_line("OVERLAY", "!! banner text measured %dx%d -- refusing", tw, th);
+        return false;
+    }
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = tw;
+    bmi.bmiHeader.biHeight      = -th;   // negative: top-down, matching how
+                                         // this file already treats texel row
+                                         // 0 as the TOP everywhere else (see
+                                         // draw_cursor's UV/NDC mapping).
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void*   bits = nullptr;
+    HDC     hdc  = CreateCompatibleDC(nullptr);
+    HBITMAP bmp  = hdc ? CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    if (!hdc || !bmp || !bits) {
+        if (bmp) DeleteObject(bmp);
+        if (hdc) DeleteDC(hdc);
+        DeleteObject(font);
+        log_line("OVERLAY", "!! CreateDIBSection failed -- no turn banner");
+        return false;
+    }
+
+    memset(bits, 0, (size_t)tw * th * 4);   // solid black = alpha 0 once converted
+
+    HGDIOBJ old_bmp = SelectObject(hdc, bmp);
+    HGDIOBJ old_font = SelectObject(hdc, font);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(255, 255, 255));
+    RECT r = { kPad, kPad, tw - kPad, th - kPad };
+    DrawTextA(hdc, text, -1, &r, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOCLIP);
+    GdiFlush();   // `bits` is read directly below; make sure GDI is done writing it
+
+    // BGRA (GDI's in-memory byte order) -> a plain alpha mask of the FILL,
+    // luminance-as-coverage. Only correct because the source is guaranteed
+    // white text on black above -- max(r,g,b) rather than any single channel
+    // is a small hedge against ClearType colour fringing at the edges.
+    uint8_t* core = (uint8_t*)malloc((size_t)tw * th);
+    if (core) {
+        const uint8_t* src = (const uint8_t*)bits;
+        for (int i = 0; i < tw * th; ++i) {
+            uint8_t lum = src[i * 4 + 0];
+            if (src[i * 4 + 1] > lum) lum = src[i * 4 + 1];
+            if (src[i * 4 + 2] > lum) lum = src[i * 4 + 2];
+            core[i] = lum;
+        }
+    } else {
+        log_line("OVERLAY", "!! out of memory building the banner's fill mask");
+    }
+
+    // A soft dark outline, added 2026-09-05 alongside the semibold change --
+    // both requested together, to read as a HUD element rather than a flat
+    // white sticker. Computed as a MAX-filter dilation of the fill's own
+    // alpha, entirely on the CPU from the buffer already in memory: no
+    // second GDI pass, no second font metric to keep in sync with the first.
+    // White fill wins where it exists; the halo only shows through where it
+    // does not, and fades in from the fill's own edge outward.
+    constexpr int kOutlineR = 2;
+    constexpr uint8_t kOutlineDarken = 40;    // 0 = black halo, 255 = white
+    constexpr float   kOutlineAlphaScale = 0.6f;
+    uint8_t* rgba = core ? (uint8_t*)malloc((size_t)tw * th * 4) : nullptr;
+    if (rgba) {
+        for (int y = 0; y < th; ++y) {
+            for (int x = 0; x < tw; ++x) {
+                const int idx = y * tw + x;
+                const uint8_t fill = core[idx];
+                if (fill > 0) {
+                    rgba[idx * 4 + 0] = 255;
+                    rgba[idx * 4 + 1] = 255;
+                    rgba[idx * 4 + 2] = 255;
+                    rgba[idx * 4 + 3] = fill;
+                    continue;
+                }
+                uint8_t halo = 0;
+                for (int dy = -kOutlineR; dy <= kOutlineR && halo < 255; ++dy) {
+                    const int ny = y + dy;
+                    if (ny < 0 || ny >= th) continue;
+                    for (int dx = -kOutlineR; dx <= kOutlineR; ++dx) {
+                        const int nx = x + dx;
+                        if (nx < 0 || nx >= tw) continue;
+                        const uint8_t v = core[ny * tw + nx];
+                        if (v > halo) halo = v;
+                    }
+                }
+                rgba[idx * 4 + 0] = kOutlineDarken;
+                rgba[idx * 4 + 1] = kOutlineDarken;
+                rgba[idx * 4 + 2] = kOutlineDarken;
+                rgba[idx * 4 + 3] = (uint8_t)((float)halo * kOutlineAlphaScale);
+            }
+        }
+    }
+    free(core);
+
+    SelectObject(hdc, old_font);
+    SelectObject(hdc, old_bmp);
+    DeleteObject(bmp);
+    DeleteDC(hdc);
+    DeleteObject(font);
+
+    if (!rgba) {
+        log_line("OVERLAY", "!! out of memory converting the banner bitmap");
+        return false;
+    }
+
+    out.tex = gl_upload_rgba(rgba, tw, th, "banner");
+    free(rgba);
+    if (!out.tex) return false;
+
+    out.tw = tw;
+    out.th = th;
+    trace("banner ready -- '%s' rendered at %dx%d, tex %u (font '%s')",
+          text, tw, th, (unsigned)out.tex, ui_font_face());
+    return true;
+}
+
+// F3.1: finds (or lazily builds) the cached banner texture for an "X/N" vote
+// string. Returns null once the small fixed cache is exhausted -- kMaxPeers+1
+// possible counts never comes close, so that only happens if the cache is
+// corrupt, and drawing nothing beats drawing a stale count.
+Banner* vote_banner_for(const char* text) {
+    for (int i = 0; i < g.vote_banner_count; ++i)
+        if (strcmp(g.vote_banner_text[i], text) == 0) return &g.vote_banner[i];
+    if (g.vote_banner_count >= State::kMaxVoteBanners) return nullptr;
+    Banner& b = g.vote_banner[g.vote_banner_count];
+    if (!build_banner_texture(b, text)) return nullptr;
+    _snprintf_s(g.vote_banner_text[g.vote_banner_count], sizeof(g.vote_banner_text[0]),
+                _TRUNCATE, "%s", text);
+    ++g.vote_banner_count;
+    return &b;
+}
+
+// Assumes the shared program/VAO/VBO from overlay_on_swap are already bound,
+// same as draw_cursor. No hotspot, no ink crop -- the whole texture is drawn,
+// anchored by its TOP-CENTRE: horizontally centred, top edge
+// kBannerTopMarginPx (scaled like everything else here) below the top of the
+// content rectangle -- THEN shifted by `x_shift_frac`/`y_shift_frac`, each a
+// fraction of the screen (positive x = right, positive y = down, the
+// ordinary screen convention), for callers that want a different anchor
+// than dead-centre-top -- see the event banners' own call site for why.
+// `tr/tg/tb` tint the baked-white texture -- see build_banner_texture's
+// header note for why the texture itself is always white and the colour is
+// a draw-time parameter instead.
+void draw_banner(const Banner& b, int win_w, int win_h, float tr, float tg, float tb,
+                 float x_shift_frac = 0.0f, float y_shift_frac = 0.0f) {
+    if (!b.tex || win_w <= 0 || win_h <= 0 || b.th <= 0) return;
+
+    const float ref  = (float)tune::kCursorRefH;   // shared reference height;
+                                                    // see kBannerPx's own note
+    const float grow = (ref > 1.0f) ? (float)win_h / ref : 1.0f;
+    const float banner_h_px = (float)tune::kBannerPx * grow;
+    const float spt = banner_h_px / (float)b.th;   // screen px per texel
+
+    const float sx =  spt * 2.0f / (float)win_w;
+    const float sy = -spt * 2.0f / (float)win_h;
+
+    const float top_px = (float)tune::kBannerTopMarginPx * grow;
+    // Screen fraction -> NDC is *2; y is negated because NDC's +1 is the TOP
+    // of the screen, the opposite of the screen-down convention the shift
+    // parameters use.
+    const float ox = 0.0f                                    + x_shift_frac * 2.0f;
+    const float oy = 1.0f - (top_px * 2.0f / (float)win_h)    - y_shift_frac * 2.0f;
+
+    const float half_w = (float)b.tw * 0.5f;
+    const float lx = ox - half_w * sx;
+    const float rx = ox + half_w * sx;
+    const float ty = oy;
+    const float by = oy + (float)b.th * sy;
+
+    const float quad[6][4] = {
+        { lx, ty, 0.0f, 0.0f }, { rx, ty, 1.0f, 0.0f }, { rx, by, 1.0f, 1.0f },
+        { lx, ty, 0.0f, 0.0f }, { rx, by, 1.0f, 1.0f }, { lx, by, 0.0f, 1.0f },
+    };
+    gl.BufferSubData(GL_ARRAY_BUFFER, 0, sizeof(quad), quad);
+
+    gl.BindTexture(GL_TEXTURE_2D, b.tex);
+    gl.Uniform1f(g.u_usetex, 1.0f);
+    gl.Uniform4f(g.u_colour, tr, tg, tb, 1.0f);
+    gl.DrawArrays(GL_TRIANGLES, 0, 6);
+}
+
 
 // --- the local mouse --------------------------------------------------------
 
@@ -892,7 +1219,7 @@ uint8_t mode_for_state(const char* state) {
 }
 
 void draw_cursor(uint8_t mode, float nx, float ny, const float rgb[3], float alpha,
-                 int win_w, int win_h) {
+                 int win_w, int win_h, float scale_mult = 1.0f) {
     // The state-specific art is off while the aiming drift is isolated: see
     // tune::kPeerCursorArt. `mode` still crosses the wire and is still stored,
     // so this is a switch rather than a removal.
@@ -932,7 +1259,7 @@ void draw_cursor(uint8_t mode, float nx, float ny, const float rgb[3], float alp
     const float ink_h = tune::kCursorInkRefH;
     const float ref   = (float)tune::kCursorRefH;
     const float grow  = (ref > 1.0f && win_h > 0) ? (float)win_h / ref : 1.0f;
-    const float k     = (float)tune::kCursorPx * grow
+    const float k     = (float)tune::kCursorPx * grow * scale_mult
                       / (ink_h > 1.0f ? ink_h : 1.0f);
     const float sx    =  k * 2.0f / (float)win_w;
     const float sy    = -k * 2.0f / (float)win_h;   // screen y is down
@@ -1069,6 +1396,8 @@ bool overlay_local_pointer(float& nx, float& ny, uint8_t& mode) {
 
 void overlay_on_swap(void* window) {
     if (!g.on || !window) return;
+
+    overlay_poll_cursorping();   // F4.2 -- cheap, no GL needed, so before resolve_gl
 
     if (!g.said_swap) {
         trace("first swap seen (window %p) -- the hook is live", window);
@@ -1290,7 +1619,50 @@ void overlay_on_swap(void* window) {
     bool any = false;
     for (uint8_t i = 0; i < kMaxPeers && !any; ++i)
         any = (i != self) && g.peers[i].have && (now - g.peers[i].at <= kStaleMs);
-    if (!any && !test) {
+
+    // F4: "It's your turn!" needs no peer data at all -- it is a purely local
+    // fact -- so it must not be gated behind "a peer cursor has arrived" the
+    // way the rest of this function is. ALSO requires cursor_recently_on_board():
+    // lockstep_local_actor() alone stays true well past a battle's end (fixed
+    // 2026-09-05 -- see mgmp_tuning.h's kTurnBanner note), which left the
+    // banner stuck on screen through the map and the level-up screen whenever
+    // a battle happened to end on this peer's own turn.
+    const bool show_banner = tune::kTurnBanner && lockstep_local_actor()
+                           && cursor_recently_on_board();
+
+    // F6/F4: same local-fact reasoning -- mgmp_choice already resolved
+    // ownership and its own recency check (choice_level_screen_owner /
+    // choice_event_screen_owner) is what makes this clear itself out once
+    // the screen closes, rather than lingering until the next node. The
+    // three screens (level-up, event, inventory) are never up at once, so
+    // checking in this order is safe -- whichever is actually live is the
+    // one with a non-kNoOwner answer. Tracked SEPARATELY from the event
+    // shift below because the three contexts are positioned differently on
+    // screen. Inventory added 2026-09-06, same "It's your cat!"/"Partner's
+    // cat!" banner as the other two -- see invlock_current_cat_owner's own
+    // header note for how it resolves the currently-shown cat.
+    const uint8_t level_owner = choice_level_screen_owner();
+    const uint8_t event_owner = (level_owner == kNoOwner) ? choice_event_screen_owner() : kNoOwner;
+    const uint8_t inv_owner   = (level_owner == kNoOwner && event_owner == kNoOwner)
+                               ? invlock_current_cat_owner() : kNoOwner;
+    const uint8_t subject_owner = (level_owner != kNoOwner) ? level_owner
+                                 : (event_owner != kNoOwner) ? event_owner
+                                 : inv_owner;
+    const bool    in_event_context     = (event_owner != kNoOwner);
+    const bool    in_inventory_context = (inv_owner   != kNoOwner);
+
+    const bool show_your_cat_banner     = tune::kCatOwnershipBanner && subject_owner == self;
+    const bool show_partner_cat_banner  = tune::kCatOwnershipBanner
+                                        && subject_owner != kNoOwner && subject_owner != self;
+
+    // F3.1: the screen-exit vote indicator, drawn regardless of any peer
+    // cursor being live -- both players need to see it, and mgmp_screensync
+    // only reports true while a real vote is actually pending.
+    uint8_t vote_count = 0, vote_total = 0;
+    const bool show_vote_banner = screensync_hud_pending(vote_count, vote_total);
+
+    if (!any && !test && !show_banner && !show_your_cat_banner && !show_partner_cat_banner
+             && !show_vote_banner) {
         if (!g.said_quiet) {
             trace("no peer position has arrived yet -- nothing to draw."
                   " Set net_cursor_gl_test = 1 to draw a marker anyway");
@@ -1393,9 +1765,84 @@ void overlay_on_swap(void* window) {
         p.cx += (p.nx - p.cx) * k;
         p.cy += (p.ny - p.cy) * k;
 
+        // F4.2: a "look here" ping is in effect for this peer -- draw bigger
+        // and at full alpha regardless of whose turn it is, since the whole
+        // point is to be seen right now.
+        const bool pinging = tune::kCursorPing && p.ping_active;
         draw_cursor(p.mode, p.cx, p.cy, kPeerRGB[i % kMaxPeers],
-                    (float)alpha_for(p.owns_turn != 0), w, h);
+                    pinging ? 1.0f : (float)alpha_for(p.owns_turn != 0), w, h,
+                    pinging ? tune::kCursorPingScale : 1.0f);
         ++g.drawn;
+    }
+
+    // F4.2: the LOCAL player's own ping, drawn over their real OS/game
+    // cursor at its own reported position -- the user's own ask: whoever
+    // presses cursor.ping_key should see their cursor change too, not just
+    // the peer(s) receiving it. Uses this peer's own colour slot (`self`)
+    // so it is visually distinct from every remote peer's highlight.
+    if (tune::kCursorPing && g.ping_key_was_down) {
+        float lnx = 0, lny = 0; uint8_t lmode = 0;
+        if (overlay_local_pointer(lnx, lny, lmode))
+            draw_cursor(lmode, lnx, lny, kPeerRGB[self % kMaxPeers], 1.0f, w, h,
+                        tune::kCursorPingScale);
+    }
+
+    // F4: drawn last, on top of everything else here, since it is the one
+    // piece of UI meant for the person at THIS keyboard rather than a
+    // representation of the other player. Light grey rather than pure white,
+    // 2026-09-05: reads as part of the HUD rather than a system dialog
+    // pasted over the scene, without shrinking the text.
+    if (show_banner) {
+        if (!g.banner_turn.tried) build_banner_texture(g.banner_turn, "It's your turn!");
+        if (g.banner_turn.tex) draw_banner(g.banner_turn, w, h, 0.75f, 0.75f, 0.75f);
+    }
+
+    // F6/F4: the ownership message -- exactly one of these two shows on a
+    // given peer's screen, since show_your_cat_banner and
+    // show_partner_cat_banner are mutually exclusive by construction. Same
+    // dark grey for both: it is the TEXT that carries the information now
+    // that the coloured corner badge is gone (removed 2026-09-05, the user's
+    // own call -- a short message was judged to read the same way the turn
+    // banner already does, with no separate visual language needed).
+    //
+    // SHIFTED per context -- each screen's own UI occupies a different part
+    // of the top of the screen, so each needed its own offset from the
+    // default dead-centre-top anchor, all tuned live against the real
+    // screens rather than guessed:
+    //   event:      25% LEFT, 3% down (tuned in three steps from 8% down,
+    //               2026-09-05/06 -- see git history for the intermediate
+    //               4%/2% steps).
+    //   inventory:  33% RIGHT, 2% down (2026-09-06, tuned live in three
+    //               steps: 30% -> 35% -> 33%) -- CatSelector_Right's own
+    //               arrow and the equip panel sit top-left/top-centre, so
+    //               this reads better clear of them on the right instead.
+    //   level-up:   default (0, 0) -- its own UI already leaves the
+    //               top-centre clear.
+    float ev_x_shift = 0.0f, ev_y_shift = 0.0f;
+    if (in_event_context)          { ev_x_shift = -0.25f; ev_y_shift = 0.03f; }
+    else if (in_inventory_context) { ev_x_shift =  0.33f; ev_y_shift = 0.02f; }
+    if (show_your_cat_banner) {
+        if (!g.banner_your_cat.tried) build_banner_texture(g.banner_your_cat, "It's your cat!");
+        if (g.banner_your_cat.tex)
+            draw_banner(g.banner_your_cat, w, h, 0.10f, 0.10f, 0.10f, ev_x_shift, ev_y_shift);
+    }
+    if (show_partner_cat_banner) {
+        if (!g.banner_partner_cat.tried) build_banner_texture(g.banner_partner_cat, "Partner's cat!");
+        if (g.banner_partner_cat.tex)
+            draw_banner(g.banner_partner_cat, w, h, 0.10f, 0.10f, 0.10f, ev_x_shift, ev_y_shift);
+    }
+
+    // F3.1: "X/N", bottom-right -- shifted right and down from draw_banner's
+    // default dead-centre-top anchor. The shift is approximate (draw_banner
+    // has no bottom-right anchor mode of its own) and was not yet tuned
+    // against a live screenshot; nudge tune::kScreenVoteXShift/YShift if it
+    // sits off the corner.
+    if (show_vote_banner) {
+        char text[16];
+        _snprintf_s(text, sizeof(text), _TRUNCATE, "%u/%u", (unsigned)vote_count, (unsigned)vote_total);
+        if (Banner* b = vote_banner_for(text))
+            draw_banner(*b, w, h, 0.90f, 0.90f, 0.90f,
+                        tune::kScreenVoteXShift, tune::kScreenVoteYShift);
     }
 
     if (!g.said_draw) {
@@ -1448,6 +1895,35 @@ void overlay_on_message(uint8_t from, const CursorMsg& c) {
         g.said_msg = true;
     }
     p.have = true;
+}
+
+void overlay_on_cursorping(uint8_t from, bool active) {
+    if (!tune::kCursorPing || from >= kMaxPeers) return;
+    g.peers[from].ping_active = active;
+}
+
+// F4.2: edge-triggered poll for cursor.ping_key. GetAsyncKeyState rather than
+// a window-message hook -- same reasoning as mgmp_follow.cpp's own VK_SHIFT
+// check: this only needs to know the key's CURRENT state once a frame, not
+// intercept it, and it works whether or not the game window has focus, which
+// matches every other hotkey this mod reads (ui.key included).
+//
+// SENDS ON BOTH EDGES, not just down -- held, not timed (see CursorPingMsg's
+// own header note for why this changed the same day it shipped).
+// `g.ping_key_was_down` doubles as "is OUR OWN ping active right now", which
+// the draw loop uses to highlight the LOCAL player's own cursor too -- the
+// user's second ask: the peer who presses the key should see their own
+// change, not just the recipient(s).
+void overlay_poll_cursorping() {
+    if (!tune::kCursorPing || !net_active()) return;
+
+    const bool down = (GetAsyncKeyState((int)config().cursor_ping_key) & 0x8000) != 0;
+    if (down != g.ping_key_was_down) {
+        CursorPingMsg m{};
+        m.active = down;
+        net_send_cursorping(m);
+    }
+    g.ping_key_was_down = down;
 }
 
 } // namespace mgmp

@@ -85,8 +85,23 @@ struct Config {
     // --- the debug panel -----------------------------------------------------
 
     bool     ui         = true;    // ui.enabled
-    bool     ui_visible = true;    // whether it starts open; ui.key toggles
+    // Starts CLOSED by default, 2026-09-06: connection is now set up by the
+    // pre-launch dialog (mgmp_loader_dialog.h), so an ordinary player never
+    // needs this panel at all. Still one keypress away for anyone who does.
+    bool     ui_visible = false;   // whether it starts open; ui.key toggles
     uint32_t ui_key     = 0x70;    // ui.key, "F1" or a raw VK code
+
+    // --- the cursor ping (F4.2) -----------------------------------------------
+
+    // cursor.ping_key -- press to briefly enlarge THIS peer's cursor on every
+    // other peer's screen, for "look here". Default 0xDE = VK_OEM_7, the key
+    // that types '²' on the user's own French AZERTY keyboard -- CONFIRMED
+    // LIVE 2026-09-06 via a full keyboard scan (VK_OEM_3/0xC0 was tried
+    // first, on the reasonable assumption it was the physical top-left key;
+    // wrong on this keyboard/driver, no fallback existed so the hotkey did
+    // nothing at all). A raw VK code, same read_vkey path ui.key uses (no
+    // F1..F12 name applies here).
+    uint32_t cursor_ping_key = 0xDE;
 
     // --- derived, not parsed -------------------------------------------------
 

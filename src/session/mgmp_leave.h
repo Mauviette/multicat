@@ -36,23 +36,36 @@
 // poll rate here and costs nothing because leaving a run is not a decision
 // anybody takes twice a second.
 //
-// --- what the client does about it, and the one thing it cannot do ----------
+// --- what the client does about it -------------------------------------
 //
 // It presses Quit To Menu for the player, through Button::Click, from the same
 // Button::update hook that already presses Play -- the proven route, and the
 // one that goes through the game's fade and the game's own guards rather than
 // synthesising a scene transition over a live battle.
 //
-// THE PAUSE MENU HAS TO BE OPEN. Button_PauseMenu_QuitToMenu does not exist
-// until PauseMenu::init has run and SetupMainSidebar has built the sidebar, and
-// PauseMenu::init only runs when a person pauses -- there is no persistent
-// PauseMenu component to reach into and no update override to hook (its slots
-// 6..15 are the ICF-folded empty virtual, the same dead end MainMenu had). So
-// this feature is "press Escape and the mod does the rest", and it says so, at
-// a severity the player will actually see. Dragging someone out of a run
-// without a keypress would mean building the transition ourselves across a
-// scene teardown nobody controls, with the battle layer holding Character*
-// pointers into it; that is a worse failure than the one being fixed.
+// THE PAUSE MENU HAS TO BE OPEN for that button to exist at all --
+// Button_PauseMenu_QuitToMenu does not exist until PauseMenu::init has run and
+// SetupMainSidebar has built the sidebar, and PauseMenu::init only runs when a
+// person pauses. There is no persistent PauseMenu component to reach into and
+// no update override to hook (its slots 6..15 are the ICF-folded empty
+// virtual, the same dead end MainMenu had), so this module cannot call its way
+// in the way it calls Button::Click.
+//
+// IT OPENS THE MENU ITSELF INSTEAD, by posting a synthetic Escape keypress to
+// the game's own window (see ui_game_window) through the same WndProc the
+// debug panel already subclasses -- the game processes it exactly as it would
+// a real press, because as far as its input layer is concerned it is one.
+// This was originally "press Escape and the mod does the rest", which worked
+// but silently did nothing for a player who never saw that log line; a
+// synthesized press has no such dependency. It stops the moment the sidebar is
+// seen (Escape TOGGLES the menu -- a second one while it is already open would
+// close it right as the click is about to land) and gives up loudly, the same
+// shape as the click retry budget, if the menu never opens at all. Dragging
+// someone out of a run by building the scene transition ourselves, instead of
+// going through a real pause-and-quit, would risk the battle layer's
+// Character* pointers into whatever is being torn down; that is a worse
+// failure than the one being fixed, so this still goes through the game's own
+// fade and guards -- it just no longer needs a finger on the key.
 //
 // A client that is ALREADY out of a run when the message arrives does nothing
 // and says so at Trace. That is the common case when the host is merely
@@ -85,6 +98,14 @@ void leave_on_message(const HostLeftMsg& m);
 // told the host left and is still inside a run.
 void leave_on_button_update(void* button);
 
+// From the shared Button::Click chain (mgmp_mainmenulock.cpp), BEFORE the
+// original is allowed to run. Returns true to swallow the click. Blocks a
+// client from abandoning the adventure themselves (host-authoritative, like
+// every other action that chain already guards); also logs any new distinct
+// "Button_PauseMenu_*" name it sees, on EITHER role, so the guess this is
+// built on can be corrected from the log if it is wrong.
+bool leave_on_client_button_click(void* button);
+
 // PANEL: arm the leave path as though the host had announced it.
 //
 // The feature has three stages that fail identically from the outside -- the
@@ -111,5 +132,20 @@ void leave_status(char* out, size_t out_size);
 // because it answers a question several modules currently answer by proxy, and
 // because the debug panel should be able to show it.
 bool leave_in_run();
+
+// From mgmp_follow's host-side MapScreen::update tick: true exactly once, the
+// first time the map is ticking again after this peer announced a departure
+// (a real HostLeftMsg went out). Consumes itself on the call that returns
+// true. See the .cpp for why this is not simply done at the "back InRun"
+// transition.
+bool leave_consume_republish_due();
+
+// General scene-presence query for any module that just needs to know
+// whether ONE named scene is currently loaded and not being torn down --
+// reuses the exact scene walk this module's own House/MainMenu/SaveSelect
+// detection already relies on, rather than a second copy of it elsewhere.
+// False whenever the scene list itself could not be read, matching this
+// module's own "gate on evidence, never a confident wrong answer" rule.
+bool leave_scene_is_loaded(const char* name);
 
 } // namespace mgmp

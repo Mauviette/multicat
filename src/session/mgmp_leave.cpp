@@ -9,7 +9,9 @@
 #include "mgmp_log.h"
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
+#include "mgmp_ui.h"         // ui_game_window -- where the synthetic Escape goes
 
+#include <windows.h>
 #include <cstring>
 #include <cstdio>
 
@@ -70,6 +72,11 @@ struct State {
     bool     announced  = false;
     uint32_t sent       = 0;
 
+    // Set the moment a HostLeftMsg actually goes out; consumed once, by
+    // leave_consume_republish_due, when the host truly ENTERS a node again --
+    // see that function's comment for why "InRun" itself is the wrong moment.
+    bool     need_republish = false;
+
     // --- client ---
     bool     pending      = false;  // told to leave, still in a run
     uint32_t presses      = 0;
@@ -79,6 +86,23 @@ struct State {
     bool     said_sidebar  = false;   // the pause sidebar was seen ticking
     uint32_t left         = 0;      // departures actually completed
     uint32_t received     = 0;
+
+    // Opening the pause menu ourselves, so a player never has to know that
+    // pressing Escape was ever part of this. Same shape as the click budget
+    // above, kept separate because the two can fail independently -- Escape
+    // can open a menu with no quit button in it, or resolve fine while
+    // Button::Click does not.
+    uint32_t escape_cooldown       = 0;
+    uint32_t escape_sent           = 0;
+    bool     said_escape_gave_up   = false;
+    bool     said_no_window        = false;
+
+    // Every distinct "Button_PauseMenu_*" name seen, logged once each --
+    // see leave_on_client_button_click's header note for why this exists
+    // alongside the actual block.
+    static constexpr uint32_t kMaxSeenNames = 16;
+    char     seen_pause_names[kMaxSeenNames][64] = {};
+    uint32_t seen_pause_count = 0;
 
     // THE LAST POSITION THE PUMP READ, so nothing else has to walk the scene
     // list to find out where we are.
@@ -271,6 +295,58 @@ void report_broken() {
                  (unsigned)kScene_Name, (unsigned)kScene_Destroying);
 }
 
+// Post a real Escape down+up to the game's own window. PostMessage (not
+// SendInput) is deliberate: it queues on the target window directly rather
+// than wherever the OS's real input focus currently is.
+//
+// FOREGROUND IS STILL REQUIRED, MEASURED LIVE -- not by PostMessage's own
+// delivery, which does not need it, but by something downstream of it (SDL's
+// own focus tracking is the leading suspect, unconfirmed) that silently
+// dropped the synthesized press until the window was actually focused. First
+// try on the loopback test sent 32 presses over roughly a minute with no
+// effect while the host window had focus, then succeeded within one retry the
+// moment attention moved to the client window -- exactly the shape of a
+// focus-gated input path, not a flaky one.
+//
+// A BARE SetForegroundWindow WAS NOT ENOUGH ON ITS OWN, ALSO MEASURED LIVE.
+// One session it took one retry; a LATER session, no other code changed, all
+// five retries failed outright with "the pause menu never opened" -- the
+// signature of Windows' own foreground-stealing restriction (a process that
+// has not "received the last input event" can have its SetForegroundWindow
+// call silently ignored, even calling from the target window's own owning
+// thread) rather than a logic bug. ui_force_foreground (mgmp_ui.h) attaches
+// this thread's input state to whatever thread currently owns the foreground
+// window first, which is the standard, reliable way around that. Taking
+// focus at all is also the right thing to do regardless of the cause -- the
+// player is about to see their own pause menu open and should not be looking
+// somewhere else when it does.
+//
+// lParam is filled in the same shape Windows itself would for a real press
+// (repeat count 1, scan code from MapVirtualKey, the up message's
+// previous-state and transition bits set) -- there is no reason to hand the
+// window a message no real keypress would ever produce, even if the specific
+// bits turn out not to matter to whatever is gating this.
+void press_escape() {
+    HWND hwnd = (HWND)ui_game_window();
+    if (!hwnd) {
+        if (!g.said_no_window) {
+            g.said_no_window = true;
+            log_line_lvl(LogLevel::Error, "LEAVE",
+                         "!! no game window to press Escape in yet -- open the pause "
+                         "menu yourself");
+        }
+        return;
+    }
+    ui_force_foreground(hwnd);
+    const LPARAM scancode = (LPARAM)MapVirtualKeyW(VK_ESCAPE, MAPVK_VK_TO_VSC);
+    PostMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, 1 | (scancode << 16));
+    PostMessageW(hwnd, WM_KEYUP,   VK_ESCAPE, 1 | (scancode << 16) | (1 << 30) | (1 << 31));
+    ++g.escape_sent;
+    g.escape_cooldown = kRetryFrames;
+    log_line("LEAVE", "still in the run -- focusing the window and pressing Escape "
+                      "for you (attempt %u)", g.escape_sent);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -284,6 +360,9 @@ void leave_init() {
     g.presses    = 0;
     g.cooldown   = 0;
     g.said_gave_up = false;
+    g.escape_sent         = 0;
+    g.escape_cooldown     = 0;
+    g.said_escape_gave_up = false;
     g.tick       = 0;
     g.where      = Where::Unknown;
     g.where_name[0] = 0;
@@ -335,6 +414,104 @@ void leave_set_base(uintptr_t /*base*/) {
 // which is finer than the thing it describes changes.
 bool leave_in_run() { return g.where == Where::InRun; }
 
+// From mgmp_follow, host-side, the moment a node is actually entered again.
+//
+// NOT CONSUMED AT THE "InRun" TRANSITION ABOVE, and that is a real correction,
+// not a style choice. where_are_we()'s positive half (savefile_adventure_is_
+// loaded, i.e. the run's cat-id list) reads true the moment the house's own
+// class-chooser / item-setup screens populate that list, WELL BEFORE the
+// player has actually validated and launched -- neither of those is one of
+// the tracked out-scenes either, so the scene test agrees. Publishing the
+// save at that point sends a client back into a run whose setup has not been
+// committed yet. Measured live 2026-09-06: a client republished at that point
+// landed on the OLD, already-abandoned adventure and only caught up once the
+// host actually clicked into the first fight -- which is also the moment the
+// existing CATDATA/ENTERNODE catch-up already resolves everything on its own,
+// making that the right moment to have republished from in the first place.
+// So this only flips on a real HostLeftMsg going out, and only flips off once
+// the host's own EnterNode publish (follow_on_enter_node) consumes it -- the
+// same "the effect is a command boundary, not a screen" rule the meta layer's
+// choice replication follows everywhere else.
+bool leave_consume_republish_due() {
+    if (!g.need_republish) return false;
+    g.need_republish = false;
+    return true;
+}
+
+bool leave_scene_is_loaded(const char* name) {
+    if (!name) return false;
+    SceneList s{};
+    if (!read_scenes(s)) return false;
+    for (uint32_t i = 0; i < s.count; ++i) {
+        if (s.dying[i]) continue;
+        if (strcmp(s.name[i], name) == 0) return true;
+    }
+    return false;
+}
+
+// --- a client must not abandon the adventure --------------------------
+//
+// The host owns the run; a client who presses "Abandon Adventure" from their
+// OWN pause menu ends their LOCAL adventure independently of the host,
+// producing the exact divergent-house scenario the rest of this module
+// exists to clean up after -- except self-inflicted, on the wrong peer, and
+// with no HostLeftMsg to explain it. Swallowed at the shared Button::Click
+// choke point every other host-authoritative action already uses (see
+// mgmp_mainmenulock.cpp).
+//
+// CONFIRMED LIVE 2026-09-06 via the discovery logging below:
+// "Button_PauseMenu_GiveUp" -- seen in the host's own log the first time a
+// real player opened their pause menu and the button was on screen. The
+// earlier guesses (AbandonRun/Abandon/AbandonAdventure/QuitAdventure, all
+// convention-based, none confirmed) matched nothing and are kept as a
+// fallback in case a different build or a different screen ever uses one of
+// them; GiveUp is listed first since it is the one actually proven to fire.
+// Every OTHER distinct Button_PauseMenu_* name is still logged once, the
+// first time either peer's own pause menu shows it to a real player -- the
+// same "swallow before dismissing" discipline this project settled on for
+// the equip-button block, kept on so the NEXT wrong guess is just as cheap
+// to correct.
+namespace {
+constexpr const char* kAbandonGuesses[] = {
+    "Button_PauseMenu_GiveUp",
+    "Button_PauseMenu_AbandonRun",
+    "Button_PauseMenu_Abandon",
+    "Button_PauseMenu_AbandonAdventure",
+    "Button_PauseMenu_QuitAdventure",
+};
+
+bool note_pause_name(const char* name) {
+    for (uint32_t i = 0; i < g.seen_pause_count; ++i)
+        if (!strcmp(g.seen_pause_names[i], name)) return false;
+    if (g.seen_pause_count >= State::kMaxSeenNames) return false;
+    strncpy_s(g.seen_pause_names[g.seen_pause_count++], name, _TRUNCATE);
+    return true;
+}
+} // namespace
+
+bool leave_on_client_button_click(void* self) {
+    ensure_state();
+    if (!self) return false;
+
+    char name[64];
+    if (!mem_read_std_string((const uint8_t*)self + kBtn_Name, name, sizeof(name)))
+        return false;
+
+    if (strncmp(name, "Button_PauseMenu_", 17) == 0 && note_pause_name(name))
+        log_line_lvl(LogLevel::Trace, "LEAVE", "pause menu button seen: '%s'", name);
+
+    if (!g.is_client) return false;
+    for (const char* guess : kAbandonGuesses) {
+        if (strcmp(name, guess) == 0) {
+            log_line_lvl(LogLevel::Warn, "LEAVE",
+                         "swallowed a client click on '%s' -- only the host may "
+                         "abandon the adventure", name);
+            return true;
+        }
+    }
+    return false;
+}
+
 void leave_pump() {
     ensure_state();
 
@@ -354,7 +531,8 @@ void leave_pump() {
     // -- reported as "worked in the battle, then did not work on the adventure
     // or in a battle either". A counter that gates the only action a module
     // takes must be counted unconditionally.
-    if (g.cooldown) --g.cooldown;
+    if (g.cooldown)        --g.cooldown;
+    if (g.escape_cooldown) --g.escape_cooldown;
 
     // Nothing armed and no role: there is nothing to watch for. `g.pending` is
     // in the test because leave_request_local arms a peer that may have no
@@ -389,9 +567,48 @@ void leave_pump() {
     // process: without this, a peer that spent its five presses once could
     // never be taken out of a later run, and the only symptom would be the
     // gave-up line from the previous one.
-    if (here == Where::InRun && (g.presses || g.said_gave_up)) {
+    //
+    // GATED ON !g.pending, AND THAT GATE IS LOAD-BEARING. Both budgets are
+    // already re-armed at the moment a NEW departure is armed (leave_on_message
+    // / leave_request_local zero them directly) -- this block exists only for
+    // the case where a PAST departure's leftover flags are still sitting here
+    // when a later run begins. Without the !g.pending guard this fired on
+    // EVERY poll of an attempt still in progress, because "still in the run"
+    // is also true of the run currently being escaped from -- so escape_sent
+    // was reset to 0 moments after every single press, kMaxPresses was never
+    // reached, and 'pressed Escape N times and gave up' could never print.
+    // Measured live: 32 consecutive "attempt 1" lines over roughly a minute
+    // where an honest counter would have said "attempt 5" and stopped after
+    // four. The retries still eventually landed, so this was invisible in the
+    // log's outcome and only visible in its shape.
+    if (!g.pending && here == Where::InRun && (g.presses || g.said_gave_up)) {
         g.presses      = 0;
         g.said_gave_up = false;
+    }
+    if (!g.pending && here == Where::InRun && (g.escape_sent || g.said_escape_gave_up)) {
+        g.escape_sent         = 0;
+        g.said_escape_gave_up = false;
+    }
+
+    // --- still pending: get the pause menu open on our own ------------------
+    //
+    // The click side (leave_on_button_update) has always worked once the menu
+    // is up; this is the half that used to require a person to notice a log
+    // line. Stops the moment the sidebar has been seen -- Escape TOGGLES the
+    // menu, so a second press while it is already open would close it right
+    // as the click is about to land -- and gives up loudly past the budget,
+    // the same shape as the click retries below.
+    if (g.pending && !g.said_sidebar && !g.escape_cooldown) {
+        if (g.escape_sent >= kMaxPresses) {
+            if (!g.said_escape_gave_up) {
+                g.said_escape_gave_up = true;
+                log_line_lvl(LogLevel::Error, "LEAVE",
+                             "pressed Escape %u times and the pause menu never opened "
+                             "-- open it yourself", g.escape_sent);
+            }
+        } else {
+            press_escape();
+        }
     }
 
     // Everything below is the ANNOUNCING half, and only that half needs a live
@@ -424,8 +641,9 @@ void leave_pump() {
     if (!g.was_in_run || g.announced) return;
     if (++g.out_polls < kConfirmPolls) return;
 
-    g.announced  = true;
-    g.was_in_run = false;
+    g.announced      = true;
+    g.was_in_run     = false;
+    g.need_republish = true;
     ++g.sent;
 
     HostLeftMsg m{};
@@ -476,16 +694,21 @@ void leave_on_message(const HostLeftMsg& m) {
     g.presses      = 0;
     g.cooldown     = 0;
     g.said_gave_up = false;
+    g.escape_sent         = 0;
+    g.escape_cooldown     = 0;
+    g.said_escape_gave_up = false;
 
     g.said_sidebar = false;
 
-    // THE LINE A PLAYER MUST NOT MISS, and the reason it names a key. There is
-    // no persistent PauseMenu to reach into -- see the header -- so the one
-    // thing this peer cannot do for itself is open the menu.
+    // No longer "press Escape yourself" -- leave_pump does that from here on.
+    // Still Warn, not Trace: if the synthesized press or the click ever fails
+    // (said_no_window / said_escape_gave_up / said_no_click above), this is
+    // the one line that tells a player why they are still standing in a run
+    // nobody else is playing.
     log_line_lvl(LogLevel::Warn, "LEAVE",
-             "the host has LEFT THE RUN (it is on '%s')%s. Press Escape: the mod "
-             "will press Quit To Menu for you, and if the host starts a run again "
-             "you will be taken back in automatically.",
+             "the host has LEFT THE RUN (it is on '%s')%s -- returning you to the "
+             "menu, and if the host starts a run again you will be taken back in "
+             "automatically.",
              m.scene,
              here == Where::InRun
                  ? " and this peer is still in it"
@@ -512,11 +735,14 @@ void leave_status(char* out, size_t out_size) {
         return;
     }
     _snprintf_s(out, out_size, _TRUNCATE,
-                "ARMED -- %s, %u press(es) left%s%s", place,
+                "ARMED -- %s, %s, %u click(s) left%s", place,
+                g.said_sidebar
+                    ? "pause menu seen"
+                    : (g.escape_cooldown
+                           ? "Escape sent, waiting"
+                           : "pressing Escape"),
                 g.presses < kMaxPresses ? kMaxPresses - g.presses : 0,
-                g.cooldown ? "  (waiting out the last press)" : "",
-                g.said_sidebar ? "  [pause menu seen]"
-                               : "  [pause menu NOT seen yet]");
+                g.cooldown ? "  (waiting out the last press)" : "");
 }
 
 void leave_request_local() {
@@ -525,13 +751,16 @@ void leave_request_local() {
     g.presses      = 0;
     g.cooldown     = 0;
     g.said_gave_up = false;
+    g.escape_sent         = 0;
+    g.escape_cooldown     = 0;
+    g.said_escape_gave_up = false;
     g.said_sidebar = false;
     // g.on is NOT required here and that is the point: the click path does not
     // depend on a session, so neither should the test of it. What it does need
     // is Button::Click, which is resolved in leave_set_base at load time.
     g.on = true;
-    log_line("LEAVE", "armed by hand from the panel%s -- open the pause menu and "
-                      "Quit To Menu will be pressed for you",
+    log_line("LEAVE", "armed by hand from the panel%s -- pressing Escape and then "
+                      "Quit To Menu for you",
              g.button_click ? "" : ", BUT Button::Click did not resolve, so "
                                    "nothing can be pressed");
 }

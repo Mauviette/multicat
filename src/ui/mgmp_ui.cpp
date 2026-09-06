@@ -724,6 +724,27 @@ void ui_shutdown() {
     g.visible = false;
 }
 
+void* ui_game_window() { return (void*)game_window(); }
+
+bool ui_force_foreground(void* hwnd_) {
+    HWND hwnd = (HWND)hwnd_;
+    if (!hwnd) return false;
+    if (GetForegroundWindow() == hwnd) return true;
+
+    const DWORD cur_thread = GetCurrentThreadId();
+    const DWORD fg_thread  = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+
+    bool attached = false;
+    if (fg_thread && fg_thread != cur_thread)
+        attached = AttachThreadInput(fg_thread, cur_thread, TRUE) != 0;
+
+    BringWindowToTop(hwnd);
+    const bool ok = SetForegroundWindow(hwnd) != 0;
+
+    if (attached) AttachThreadInput(fg_thread, cur_thread, FALSE);
+    return ok;
+}
+
 bool ui_captures_input() {
     if (!g.ready || !g.visible) return false;
     const ImGuiIO& io = ImGui::GetIO();

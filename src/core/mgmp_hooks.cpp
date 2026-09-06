@@ -30,6 +30,8 @@
 #include "mgmp_addresses.h"
 #include "mgmp_catsync.h"
 #include "mgmp_combatlock.h"
+#include "mgmp_mainmenulock.h"
+#include "mgmp_turnbadge.h"
 #include "mgmp_cursor.h"
 #include "mgmp_choice.h"
 #include "mgmp_overlay.h"
@@ -37,6 +39,10 @@
 #include "mgmp_aim.h"
 #include "mgmp_nodehash.h"
 #include "mgmp_runhist.h"
+#include "mgmp_ownership.h"
+#include "mgmp_invlock.h"
+#include "mgmp_screensync.h"
+#include "mgmp_shopmirror.h"
 #include "mgmp_config.h"
 #include "mgmp_tuning.h"
 #include "mgmp_timedelay.h"
@@ -51,6 +57,7 @@
 #include "mgmp_follow.h"
 #include "mgmp_savefile.h"
 #include "mgmp_leave.h"
+#include "mgmp_cutscene.h"
 #include "mgmp_rng.h"
 #include "mgmp_rtti.h"
 #include "mgmp_turnaction.h"
@@ -535,6 +542,8 @@ void __fastcall h_StatusMenu(void* self) {
     // submits are this frame's, so ours belong in the same batch rather than
     // trailing the previous one.
     cursor_on_status_menu(self);
+    // F4: same batch, same reasoning -- see mgmp_turnbadge.h.
+    turnbadge_on_status_menu(self);
 }
 
 // --- QoL: the combat menu greys out on a cat this peer does not own --------
@@ -562,6 +571,25 @@ char __fastcall h_HighlightRefresh(void* self) {
     return o_HighlightRefresh(self);
 }
 
+// REVERTED, 2026-09-05: an experimental auto close+reopen of the client's own
+// inventory screen was tried here (press "CloseButton" then "Map_Backpack" via
+// Button::Click, timed off a per-frame Button+504 name scan through this same
+// hook) to work around MapScreen::update not ticking while that screen is
+// open. The close half worked; the reopen click had no visible effect --
+// Button::Click silently refused or the button was not what it looked like --
+// leaving the client's screen closed with no way back, which is worse than
+// the accepted limitation it was trying to remove (data always correct;
+// manual close/reopen needed to see the latest state). Do not retry without a
+// way to verify the reopen actually lands, e.g. by confirming
+// InventoryScreen2 reappears in the scene's component list rather than
+// trusting a button reappearing.
+//
+// Button names seen live while the inventory screen was open, kept in case a
+// future attempt needs them: CloseButton, Map_Backpack (opens it from the
+// map), CatSelector_Left/CatSelector_Right (cat navigation), and one
+// EquippedButton_<slot> per gear slot (face, neck, weapon, and presumably a
+// fourth -- only three were seen in that session).
+
 void __fastcall h_ButtonUpdate(void* self) {
     // Fires for every button in the game. Outside a combat-menu tick this is a
     // load and a branch: combatlock_on_button's first test is the scope flag.
@@ -582,6 +610,33 @@ void __fastcall h_ButtonUpdate(void* self) {
     // INTO the host's run, Quit To Menu in the pause sidebar gets it back
     // OUT when the host has left. Same slot, same trampoline reasoning.
     leave_on_button_update(self);
+
+    // F4.1: keeps the peer cursor alive under a modal screen (inventory,
+    // pause menu, level-up) where MapScreen::update does not tick -- see
+    // cursor_on_map_tick's own comment. Gated on cursor_recently_on_board(),
+    // NOT lockstep_in_battle() -- the latter stays true for the rest of the
+    // session after the first fight (CLAUDE.md rule 4's trap, found
+    // 2026-09-05 chasing a missing cursor on the level-up screen), which
+    // silently killed this off-battle publisher everywhere past the first
+    // battle. See mgmp_cursor.h for the fix.
+    if (!cursor_recently_on_board()) cursor_on_map_tick();
+
+    // Cahier des charges: close the client's modal screen once the host has
+    // moved on to a node this peer has not entered -- see mgmp_follow.h.
+    // Same "fires under any screen state" property as the cursor call above.
+    follow_on_button_update(self);
+
+    // F3.1: the screen-exit vote barrier's per-frame tick -- see
+    // mgmp_screensync.h. Cheap outside the two tracked button names.
+    screensync_on_button_update(self);
+
+    // F3.1: the shop/chest purchase mirror's per-frame tick -- see
+    // mgmp_shopmirror.h.
+    shopmirror_on_button_update(self);
+
+    // F6/F4: caches CatSelector_Right's own live CatData* for the inventory
+    // screen's ownership badge -- see mgmp_invlock.h.
+    invlock_on_button_update(self);
 }
 
 // The aim preview turns the acting cat while a decision is held, writing the
@@ -636,9 +691,19 @@ void __fastcall h_SaveSelUpdate(void* self) {
 // reads and does not own -- so handing it a std::string of ours is exactly as
 // valid as the vector element the game would have passed.
 void* __fastcall h_MewDirInit(void* self, void* name) {
+    void* ret;
     if (const void* sub = savefile_redirect_load())
-        return o_MewDirInit(self, (void*)sub);
-    return o_MewDirInit(self, name);
+        ret = o_MewDirInit(self, (void*)sub);
+    else
+        ret = o_MewDirInit(self, name);
+
+    // AFTER the original: the save-slot click that leads here fires before
+    // MewDirector has anything loaded (measured 2026-09-04: "no adventure
+    // loaded" at that exact moment), so publishing there was silently a
+    // no-op. This is the point both the host's own inventory greying (F6)
+    // and the network push actually have a populated cat list to read.
+    ownership_publish("MewDirector initialized");
+    return ret;
 }
 
 // The two inventory blob accessors. Both bodies are one predicted branch on a
@@ -677,6 +742,37 @@ void __fastcall h_FrameBegin(void* self) {
     // keep arriving while a brain is polled -- a peer's decision has to be able
     // to land in the middle of our wait for it, not only between turns.
     session_update();
+
+    // F2's ownership table needs the run's cat list populated, and neither
+    // the save-slot click nor MewDirector::init turned out to be that moment
+    // -- both measured 2026-09-04 with the count still unreadable right
+    // after. The actual population happens somewhere in ContinueAdventure,
+    // which is not hooked (adding one needs a signature this machine has no
+    // IDA to generate). Retrying here instead of guessing the right one-shot
+    // event: ownership_publish's own early-outs make an unpopulated attempt
+    // a couple of cheap memory reads, and a populated one that has not grown
+    // since the last publish is one integer compare -- safe to call every
+    // frame for the life of the process.
+    ownership_publish("frame tick");
+
+    // F5: a plain integer decrement almost always; only calls into the
+    // game's serializer once a debounce armed by a real equip/unequip click
+    // settles. See mgmp_invlock.h.
+    invlock_frame_tick();
+
+    // F3.1: paces the level-up-recipient watch/redirect windows in real
+    // frames -- see mgmp_shopmirror.h.
+    shopmirror_frame_tick();
+
+    // F1.1: continuous facing broadcast for every locally-owned human cat
+    // EXCEPT the current actor (see the long note in mgmp_lockstep.cpp for
+    // why that one is excluded here and left to the action- and turn-
+    // boundary pushes instead).
+    lockstep_face_frame_tick();
+
+    // Local presentation skip, no protocol involvement -- runs regardless of
+    // session phase or role. See mgmp_cutscene.h.
+    cutscene_pump();
 
     o_FrameBegin(self);
 }
@@ -848,17 +944,26 @@ int hooks_install() {
     }
 
     rng_set_base(g_base);
+    follow_set_base(g_base);
     catsync_set_base(g_base);
     invsync_set_base(g_base);
     runhist_set_base(g_base);
+    ownership_set_base(g_base);
     nodehash_set_base(g_base);
     aim_set_base(g_base);
     lockstep_set_base(g_base);
     cursor_set_base(g_base);
+    turnbadge_set_base(g_base);
     choice_set_base(g_base);
     savefile_set_base(g_base);
     leave_set_base(g_base);
     overlay_set_base(g_base);
+    invlock_set_base(g_base);
+    invlock_init();   // F6: the real equip block (per-frame poll), see mgmp_invlock.h
+    mainmenulock_install_click_guard();   // client never presses Play, see mgmp_mainmenulock.h
+    screensync_set_base(g_base);          // F3.1 -- see mgmp_screensync.h
+    shopmirror_set_base(g_base);          // F3.1 -- see mgmp_shopmirror.h
+    shopmirror_install_levelup_hook(g_base);   // F3.1 -- the recipient/options fix
 
     int installed = 0;
     for (const Binding& b : kBindings)

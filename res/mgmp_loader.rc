@@ -1,2 +1,34 @@
 // The loader half. See mgmp_dll.rc for why this is a separate file.
+#include <windows.h>   // DS_MODALFRAME, WS_*, BS_* -- the DIALOGEX style/control constants
 #include "mgmp_version.rc"
+#include "resource.h"
+
+// The pre-launch connection picker -- see mgmp_loader_dialog.cpp for the code
+// that drives it. English, 2026-09-06 (was French at first) -- deliberately
+// still no accented/non-ASCII characters in any string: the RC compiler's
+// default codepage is not guaranteed to be UTF-8, and a mis-rendered
+// character is a worse first impression than plain ASCII.
+IDD_LAUNCHER DIALOGEX 0, 0, 240, 146
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Mewgenics -- mgmp co-op"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "This PC is:", -1, 10, 10, 150, 10
+    CONTROL         "Host", IDC_RADIO_HOST, "Button",
+                    BS_AUTORADIOBUTTON | WS_GROUP, 10, 24, 210, 10
+    CONTROL         "Client (join a host)", IDC_RADIO_CLIENT, "Button",
+                    BS_AUTORADIOBUTTON, 10, 38, 210, 10
+
+    LTEXT           "Host IP:", IDC_LABEL_ADDR, 10, 58, 75, 10
+    EDITTEXT        IDC_EDIT_ADDR, 90, 56, 130, 14, ES_AUTOHSCROLL
+
+    LTEXT           "Port:", IDC_LABEL_PORT, 10, 78, 75, 10
+    EDITTEXT        IDC_EDIT_PORT, 90, 76, 60, 14, ES_AUTOHSCROLL | ES_NUMBER
+
+    CONTROL         "Don't show this window on startup",
+                    IDC_CHECK_NOSHOW, "Button", BS_AUTOCHECKBOX,
+                    10, 100, 220, 10
+
+    DEFPUSHBUTTON   "Launch", IDOK, 60, 122, 55, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 125, 122, 55, 16
+END

@@ -2,6 +2,10 @@
   "game": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Mewgenics\\Mewgenics.exe",
   "log": "mgmp_trace.log",
 
+  "launcher": {
+    "enabled": true
+  },
+
   "net": {
     "role": "off",
     "addr": "127.0.0.1",
@@ -11,7 +15,7 @@
 
   "ui": {
     "enabled": true,
-    "visible": true,
+    "visible": false,
     "key": "F1"
   },
 

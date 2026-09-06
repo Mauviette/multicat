@@ -119,6 +119,26 @@ bool lockstep_local_actor();
 // and a menu greyed out when it should not be reads as a bug in the game.
 bool lockstep_peer_owns_character(const void* character);
 
+// F4 (cahier-des-charges-mgmp-fork.md): which peer owns this Character, for
+// the turn-owner badge -- generalises lockstep_peer_owns_character's boolean
+// to an actual peer id. kNoOwner (mgmp_ownertable.h) covers everything that
+// function returns false for (no session, a summon, an AI cat) plus the one
+// case it cannot distinguish from those: a human cat whose owner the F2 table
+// has not decided yet.
+uint8_t lockstep_owner_of_character(const void* character);
+
+// F4: the board tile a live Character* is standing on, trusted only if its
+// TacticsObject round-trips back to it -- same validation read_cat_state
+// applies for the state hash, exposed standalone for the badge. False (with
+// x=y=0) if the round trip does not hold; the caller must not guess.
+bool lockstep_character_tile(const void* character, int32_t& x, int32_t& y);
+
+// F4: the Character* currently being asked for a decision, but only when a
+// HUMAN is deciding -- nullptr for an AI/summon turn (nothing to badge) or
+// between battles. Refreshed every frame of the actor's turn, same as
+// lockstep_local_actor's own source.
+const void* lockstep_current_actor();
+
 // --- diagnostics ------------------------------------------------------------
 
 struct LockstepStats {
@@ -159,6 +179,46 @@ bool lockstep_aim_subject(const void* character, uint8_t& cat, bool& peer_owns);
 void     lockstep_preview_facing_begin(void* brain);
 void     lockstep_preview_facing_end();
 uint32_t lockstep_preview_facing_count();
+
+// F1.1: called from lockstep_on_applied for whichever cat a real TurnAction
+// (type 2 or 3) just resolved for. Pushes that cat's CURRENT, settled facing
+// as authoritative if this peer owns it -- not on every write, just once per
+// action, which end-turn guarantees happens at least once per turn
+// regardless of how the cat got to its final facing. See mgmp_lockstep.cpp
+// for the earlier, continuously-policing shapes this replaced and why each
+// one broke, and for the known limitation this simplification accepts.
+void lockstep_on_action_applied(const void* actor);
+
+// F1.1: called from lockstep_turn_boundary, once per turn boundary, for every
+// locally-owned human cat -- deliberately NOT once per frame. See the long
+// note in mgmp_lockstep.cpp for why: Character+0x388 is not a safe read while
+// a cat's CombatAnimation is in flight (the same reason it cannot go in the
+// state hash), and a per-frame poll reads it constantly during exactly that
+// window. The turn boundary is the same "settled" checkpoint
+// trace_state_deltas already relies on for the same field.
+void lockstep_face_turn_tick();
+
+// F1.1: called every frame (from FrameBegin). Continuously broadcasts every
+// locally-owned human cat's facing EXCEPT the current actor's -- on change,
+// and on a 200ms heartbeat regardless of change. An idle cat has no
+// CombatAnimation in flight, so it is safe to poll every frame, and doing so
+// is what a turn boundary alone cannot: an attack decided independently on
+// another peer is not gated by anything, so the window between a free click
+// and an attack that reads it can be shorter than one turn boundary. The
+// heartbeat matters as much as the on-change send: a cat whose value is not
+// currently changing still needs re-affirming, because the OTHER (non-owning)
+// peer can corrupt its own local copy at any time with nothing on the
+// sending side to detect it. The acting cat is excluded and left to the
+// action-boundary push and the turn-boundary re-affirm, both of which read it
+// at moments already known to be free of an in-flight animation. See the long
+// note in mgmp_lockstep.cpp.
+void lockstep_face_frame_tick();
+
+struct FaceMsg;
+// From the lockstep pump: applies an incoming facing change to the named
+// cat. A real input, so a stale battle is dropped the same way ACTION is,
+// never silently accepted.
+void lockstep_on_face_message(const FaceMsg& m);
 
 // --- the state fence -------------------------------------------------------
 //

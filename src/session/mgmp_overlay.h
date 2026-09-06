@@ -90,4 +90,17 @@ struct CursorMsg;
 // message: mgmp_cursor takes the tile out of it and this takes the fraction.
 void overlay_on_message(uint8_t from, const CursorMsg& c);
 
+// F4.2: peer `from`'s cursor-ping hotkey just went down (active=true) or up
+// (active=false) -- enlarge/brighten their cursor on THIS screen for exactly
+// as long as `active` stays true. From the lockstep pump, same as
+// overlay_on_message above.
+void overlay_on_cursorping(uint8_t from, bool active);
+
+// F4.2: called once per swap (mgmp_overlay owns the only per-frame hook that
+// runs regardless of context -- in battle, on the map, in a shop, anywhere).
+// Polls cursor.ping_key with edge detection and sends a CursorPingMsg on
+// BOTH edges (down and up) -- held, not timed. Safe to call with no session
+// at all: it just does nothing.
+void overlay_poll_cursorping();
+
 } // namespace mgmp

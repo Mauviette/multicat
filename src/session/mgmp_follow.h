@@ -47,6 +47,10 @@ namespace mgmp {
 
 struct EnterNodeMsg;
 
+// Resolves Call::C_ButtonClick, for follow_on_button_update below. Call once
+// alongside the module's other _set_base calls.
+void follow_set_base(uintptr_t base);
+
 void follow_init();
 void follow_shutdown();
 
@@ -66,6 +70,23 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent);
 void* follow_map_update(void* map_screen);
 
 void follow_on_message(const EnterNodeMsg& m);
+
+// Cahier des charges: close any modal screen (currently: anything with a
+// button literally named "CloseButton") the CLIENT has open once the host
+// has moved on to a node this peer has not entered yet. From h_ButtonUpdate,
+// every frame, every button -- see the .cpp for why that hook and not a
+// MapScreen one, and why this only ever closes, never reopens.
+void follow_on_button_update(void* button);
+
+// Called from the shared Button::Click hook, BEFORE the original would run.
+// Swallows a client's own click on a map node ("Map_Node" -- every node
+// shares this literal name) so it never even SELECTS one: EnterNode already
+// refused to enter on the client, but nothing stopped MapNode::Click's own
+// visible selection/confirmation-popup effect from running first, which is
+// what the host-authoritative map is supposed to prevent. Returns true if
+// swallowed (the caller must not call the original); false for anything
+// else, including every click on the host.
+bool follow_on_button_click(void* self);
 
 // HOST: tell a peer that just joined which node the run is standing in. ENTERNODE
 // is otherwise published only at the instant of entry, so a peer connecting

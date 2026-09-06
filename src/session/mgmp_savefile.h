@@ -86,6 +86,30 @@ void savefile_set_base(uintptr_t base);
 // the host has not published yet, or on a client.
 void savefile_catchup(uint8_t peer);
 
+// From mgmp_leave, the moment it sees the host back InRun after having
+// announced a departure (HostLeftMsg) earlier -- i.e. the host resumed a run
+// WITHOUT a fresh save-selection click, which is exactly what happens when
+// Play/Continue is pressed straight from the house after a game over. That
+// is the only path into a run this module does not already see: every other
+// one goes through savefile_on_slot_click, which republishes on its own.
+//
+// Without this, a client that was correctly returned to the main menu (see
+// mgmp_leave) has nothing telling it the host is playing again -- it stays
+// on the menu forever, because savefile_on_button_update only fires
+// once a NEW SaveFileMsg with fresh=1 has cleared its g.applied latch, and
+// nothing was resending one. Host-only; no-op without an already-known slot
+// (nothing chosen yet in this process) or without a live session.
+void savefile_republish();
+
+// From mgmp_follow's host-side MapScreen::update tick, unconditionally (cheap
+// no-op the vast majority of frames). Consumes the flag `publish()` sets
+// whenever it sends a ready=0 save (host was in the house, not on the map,
+// at that moment) and republishes -- this time genuinely ready=1 -- the
+// first time the map is confirmed ticking afterward. See SaveFileMsg::ready
+// in mgmp_proto.h for the full picture and savefile_republish for why the
+// republish itself needs no new logic of its own.
+void savefile_on_host_map_tick();
+
 // From h_SaveSlotClick. Returns false if the caller must NOT run the original,
 // which is how a client's local pick is swallowed.
 bool savefile_on_slot_click(void* save_selection, int slot);

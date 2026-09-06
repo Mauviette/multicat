@@ -142,6 +142,13 @@ constexpr uint64_t kStaleMs = 3000;
 constexpr uint64_t kMinSendGapMs   = 50;
 constexpr uint64_t kHeartbeatMs    = 500;
 
+// How long since the last GENUINE battle-board tick before cursor_map_tick is
+// allowed to run. Generous compared to a frame (even 15 FPS is ~66ms) so it
+// never races a slow frame, but short enough that leaving the battle screen
+// is noticed almost immediately rather than at the next battle's roster
+// reset -- see cursor_recently_on_board.
+constexpr uint64_t kBoardStaleMs = 200;
+
 struct Peer {
     CursorMsg msg;
     uint64_t  at   = 0;       // GetTickCount64 when it arrived
@@ -179,6 +186,12 @@ struct State {
     bool said_no_ui       = false;
     bool said_epoch_skew  = false;
     uint32_t drawn_frames = 0;
+
+    // GetTickCount64 of the last time cursor_on_status_menu actually found a
+    // valid grid -- i.e. a StatusMenu genuinely on a battle board, not merely
+    // "a battle roster exists". See cursor_recently_on_board's header note in
+    // mgmp_cursor.h for why lockstep_in_battle() cannot answer this question.
+    uint64_t last_board_tick = 0;
 } g;
 
 const Config& cfg() { return config(); }
@@ -265,6 +278,34 @@ void submit(void* ui, uint8_t peer, const char* id_prefix, const char* anim_name
     const PieceScale scale = { { 1.0, 1.0, 1.0 } };   // native size
     g.tile_piece(ui, &id, layer, &anim, tile, rgba.v, kFrame, scale.v);
 
+}
+
+// Shared by both publish sites (battle and map): sends `out` if it moved and
+// the min gap has passed, or unconditionally once the heartbeat is due.
+// EVERY FIELD OF THE MESSAGE is part of the moved test, and `mode` is the one
+// that used to be left out. This test decides whether the frame is worth a
+// packet, so a field missing from it is a field that only ever travels on
+// the 500 ms heartbeat: pick up a spell and the peer keeps drawing the plain
+// arrow for up to half a second, and a player who selects, aims and clicks
+// inside that window never shows the spell cursor at all. Same class of
+// defect as sending a field nobody draws -- the pipeline is intact, the
+// screen wrong.
+void maybe_send(const CursorMsg& out, uint64_t now) {
+    const bool moved = !g.have_sent ||
+                       out.x != g.last_sent.x || out.y != g.last_sent.y ||
+                       out.on_board  != g.last_sent.on_board ||
+                       out.owns_turn != g.last_sent.owns_turn ||
+                       out.nx != g.last_sent.nx || out.ny != g.last_sent.ny ||
+                       out.mode != g.last_sent.mode ||
+                       out.battle_id != g.last_sent.battle_id;
+    const uint64_t since = now - g.last_send_at;
+    if ((moved && since >= kMinSendGapMs) || since >= kHeartbeatMs) {
+        if (net_send_cursor(out)) {
+            g.last_sent    = out;
+            g.have_sent    = true;
+            g.last_send_at = now;
+        }
+    }
 }
 
 void draw_peer(void* ui, uint8_t peer, const CursorMsg& c) {
@@ -368,6 +409,10 @@ void cursor_on_status_menu(void* sm) {
     const bool     mine   = lockstep_local_actor();
     const uint64_t now    = GetTickCount64();
 
+    // A GENUINE board tick, timestamped -- see cursor_recently_on_board for
+    // why this exists instead of asking lockstep whether a battle is "active".
+    g.last_board_tick = now;
+
     // --- our own cursor: fade it when the turn is not ours ------------------
     set_local_pip_alpha(sm, alpha_for(mine));
     g.touched_pips = true;
@@ -390,28 +435,7 @@ void cursor_on_status_menu(void* sm) {
         out.on_board = 0;
     }
 
-    // EVERY FIELD OF THE MESSAGE, and `mode` is the one that used to be left
-    // out. This test decides whether the frame is worth a packet, so a field
-    // missing from it is a field that only ever travels on the 500 ms
-    // heartbeat: pick up a spell and the peer keeps drawing the plain arrow for
-    // up to half a second, and a player who selects, aims and clicks inside
-    // that window never shows the spell cursor at all. Same class of defect as
-    // sending a field nobody draws -- the pipeline is intact, the screen wrong.
-    const bool moved = !g.have_sent ||
-                       out.x != g.last_sent.x || out.y != g.last_sent.y ||
-                       out.on_board  != g.last_sent.on_board ||
-                       out.owns_turn != g.last_sent.owns_turn ||
-                       out.nx != g.last_sent.nx || out.ny != g.last_sent.ny ||
-                       out.mode != g.last_sent.mode ||
-                       out.battle_id != g.last_sent.battle_id;
-    const uint64_t since = now - g.last_send_at;
-    if ((moved && since >= kMinSendGapMs) || since >= kHeartbeatMs) {
-        if (net_send_cursor(out)) {
-            g.last_sent    = out;
-            g.have_sent    = true;
-            g.last_send_at = now;
-        }
-    }
+    maybe_send(out, now);
 
     // --- draw everybody else ------------------------------------------------
     void* ui = g.im_game_ui(sm);
@@ -457,6 +481,43 @@ void cursor_on_status_menu(void* sm) {
         draw_peer(ui, i, p.msg);
         ++g.drawn_frames;
     }
+}
+
+// F4.1, 2026-09-05: publishes this peer's screen-space pointer while on the
+// map, i.e. exactly when cursor_on_status_menu is NOT running (there is no
+// StatusMenu, no board, no "whose turn" off a battle screen). The receiving
+// draw is already unconditional -- mgmp_overlay.cpp's screen-space pointer
+// has never been gated on being in a battle, only on message staleness, so
+// nothing changes there. The tile reticle in THIS file only ever draws a
+// message with on_board set, so leaving it 0 here keeps it silent by
+// construction rather than needing a separate off switch.
+// Fixed 2026-09-05: h_ButtonUpdate used to gate this call on
+// !lockstep_in_battle(), which reads as "is a battle currently running" but
+// actually computes "has a roster been snapshotted and not yet replaced" --
+// CLAUDE.md's rule 4, the exact trap. lockstep_in_battle() stays TRUE from a
+// battle's first snapshot until the NEXT battle's roster differs, i.e. for
+// the entire post-battle stretch too: the level-up screen, the map, shops,
+// the inventory, all of it, for the rest of the session after the FIRST
+// fight. The peer cursor went dark everywhere off-battle the moment one
+// battle had happened, which is why it only ever tested clean before any
+// fight. This asks cursor_on_status_menu directly, via a timestamp it sets
+// only when it actually finds a live grid, instead of asking lockstep a
+// question shaped like the answer but not equal to it.
+bool cursor_recently_on_board() {
+    return (GetTickCount64() - g.last_board_tick) < kBoardStaleMs;
+}
+
+void cursor_on_map_tick() {
+    if (!g.on || !net_active()) return;
+
+    CursorMsg out;
+    out.battle_id = 0;   // no battle context on the map
+    out.owns_turn = 1;   // no turn to dim against; draw at full alpha
+    out.on_board  = 0;   // nothing to point at without a tactics grid
+
+    overlay_local_pointer(out.nx, out.ny, out.mode);
+
+    maybe_send(out, GetTickCount64());
 }
 
 } // namespace mgmp
